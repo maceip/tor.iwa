@@ -1,0 +1,28 @@
+{
+  "id": "/",
+  "name": "Tor Browser (WASM)",
+  "short_name": "Tor",
+  "version": "1.0.0",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "type": "image/png",
+      "sizes": "192x192",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any maskable"
+    }
+  ],
+  "start_url": "/",
+  "display": "standalone",
+  "scope": "/",
+  "permissions_policy": {
+    "cross-origin-isolated": ["self"],
+    "direct-sockets": ["self"],
+    "direct-sockets-private": ["self"]
+  }
+}
