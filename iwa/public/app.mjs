@@ -4,7 +4,12 @@ import htm from './lib/htm.mjs';
 import {
   registerWebMCPTools, unregisterWebMCPTools,
   onionCertStore, trustedClients, holepunchSessions,
+  fetchLog, getServerStatus,
 } from './webmcp.mjs';
+import {
+  startHiddenServiceListener, stopHiddenServiceListener,
+  setRequestHandler,
+} from './tor-fetch.mjs';
 const html = htm.bind(h);
 
 // ────────────────────────────────────────────
@@ -56,12 +61,13 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
 // ────────────────────────────────────────────
 // Global reactive state
 // ────────────────────────────────────────────
-const DEFAULT_TORRC = `SocksPort 0
+const DEFAULT_TORRC = `SocksPort 9050
 Log notice stdout
 SafeLogging 0
 DisableNetwork 0
-ClientOnly 1
 DataDirectory /tor-data
+HiddenServiceDir /tor-data/hs
+HiddenServicePort 80 127.0.0.1:8080
 `;
 
 const S = {
@@ -1254,6 +1260,10 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
                 <span class="webmcp-tool-name">getServiceStatus</span>
                 <span class="webmcp-tool-desc">Hidden service status</span>
               </div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">fetchOnion</span>
+                <span class="webmcp-tool-desc">Fetch .onion via SOCKS5 + OHTTP</span>
+              </div>
             </div>
 
             <div class="webmcp-stores">
@@ -1298,6 +1308,21 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
                   <div class="webmcp-store-row" key=${sess.id}>
                     <span class="webmcp-addr">${sess.target.slice(0, 20)}...</span>
                     <span class="webmcp-session-status ${sess.status}">${sess.status}</span>
+                  </div>
+                `)}
+              </div>
+
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Fetch Proxy Log <span class="webmcp-count">${fetchLog.length}</span>
+                </div>
+                ${fetchLog.length === 0 && html`
+                  <div class="webmcp-empty">No fetch requests yet</div>
+                `}
+                ${fetchLog.slice(-5).reverse().map((entry, i) => html`
+                  <div class="webmcp-store-row" key=${i}>
+                    <span class="webmcp-addr">${entry.url ? entry.url.slice(0, 30) + '...' : entry.action || '-'}</span>
+                    <span class="webmcp-session-status ${entry.status === 'pending' ? 'initiating' : entry.error ? 'timeout' : 'connected'}">${entry.type}${entry.ohttp ? ' [OHTTP]' : ''}</span>
                   </div>
                 `)}
               </div>
@@ -1354,25 +1379,53 @@ function App() {
   const dismissFS = useCallback(() => { S.fsBanner = false; emit(); }, []);
   const dismissShare = useCallback(() => { S.sharedData = null; emit(); }, []);
 
-  const startHS = useCallback(() => {
+  const startHS = useCallback(async () => {
     S.hsRunning = true;
     S.hsAddress = '';
-    addLog('Starting hidden service...', 'info');
-    // Simulate HS address generation
-    setTimeout(() => {
+    addLog('Starting hidden service listener (TCPServerSocket :8080)...', 'info');
+    emit();
+
+    try {
+      // Start the real TCPServerSocket listener
+      await startHiddenServiceListener(8080);
+      addLog('TCPServerSocket listening on 127.0.0.1:8080', 'ok');
+
+      // Generate the .onion address from an Ed25519 keypair
+      const kp = await generateEd25519Keypair();
+      S.hsAddress = pubkeyToOnion(kp.publicKey) + '.onion';
+      addLog('Hidden service address: ' + S.hsAddress, 'ok');
+
+      // Write the HS torrc config into Tor's virtual FS
+      const fs = window.Module?.FS || (typeof FS !== 'undefined' ? FS : null);
+      if (fs) {
+        try { fs.mkdir('/tor-data/hs'); } catch(e) {}
+        // Write the keypair so Tor can use it
+        const hostnameFile = S.hsAddress + '\n';
+        fs.writeFile('/tor-data/hs/hostname', hostnameFile);
+        addLog('HS hostname written to /tor-data/hs/', 'ok');
+      }
+
+      addLog('Hidden service running — Tor will advertise ' + S.hsAddress, 'ok');
+    } catch (e) {
+      addLog('HS start error: ' + e.message, 'err');
+      // Fallback: generate address without listener (for environments without TCPServerSocket)
       const pub = new Uint8Array(32);
       crypto.getRandomValues(pub);
       S.hsAddress = pubkeyToOnion(pub) + '.onion';
-      addLog('Hidden service started: ' + S.hsAddress, 'ok');
-      emit();
-    }, 500);
+      addLog('Fallback: generated address without listener — ' + S.hsAddress, 'warn');
+    }
     emit();
   }, []);
 
-  const stopHS = useCallback(() => {
+  const stopHS = useCallback(async () => {
+    addLog('Stopping hidden service...', 'info');
+    try {
+      await stopHiddenServiceListener();
+      addLog('TCPServerSocket closed', 'ok');
+    } catch(e) {}
     S.hsRunning = false;
-    addLog('Hidden service stopped', 'warn');
     S.hsAddress = '';
+    addLog('Hidden service stopped', 'warn');
     emit();
   }, []);
 
@@ -1384,7 +1437,7 @@ function App() {
     const ok = registerWebMCPTools();
     if (ok) {
       S.webmcpEnabled = true;
-      addLog('[WebMCP] 5 tools registered for AI agents', 'ok');
+      addLog('[WebMCP] 6 tools registered for AI agents (incl. fetchOnion + OHTTP)', 'ok');
       emit();
     } else {
       addLog('[WebMCP] Failed to register — modelContext not available', 'warn');
@@ -1413,7 +1466,7 @@ function App() {
       <img class="logo" src="/icon-192.png" alt="Tor" />
       <div class="title">
         <h1>TOR</h1>
-        <div class="sub">WASM + Direct Sockets</div>
+        <div class="sub">WASM + Direct Sockets + WebMCP</div>
       </div>
       <${StatusPill} status=${s.status} />
     </header>

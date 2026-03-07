@@ -1,11 +1,12 @@
 // Service Worker for Tor IWA
-const CACHE_NAME = 'tor-iwa-v5';
+const CACHE_NAME = 'tor-iwa-v6';
 const ASSETS = [
   '/',
   '/index.html',
   '/app.css',
   '/app.mjs',
   '/webmcp.mjs',
+  '/tor-fetch.mjs',
   '/tor.js',
   '/tor.wasm',
   '/.well-known/manifest.webmanifest',

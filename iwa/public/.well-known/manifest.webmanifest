@@ -46,6 +46,10 @@
       {
         "name": "getServiceStatus",
         "description": "Get the current status of this Tor hidden service"
+      },
+      {
+        "name": "fetchOnion",
+        "description": "Fetch a .onion URL through this IWA's Tor circuit via SOCKS5 Direct Sockets, with optional OHTTP encapsulation"
       }
     ]
   }

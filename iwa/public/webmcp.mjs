@@ -1,12 +1,11 @@
 // ────────────────────────────────────────────
 // WebMCP Tool Registration for Tor Hidden Service
-// Exposes holepunch, cert validation, and trusted client
-// management to remote AI agents via navigator.modelContext
+// Exposes holepunch, cert validation, trusted client
+// management, and .onion fetch proxy to AI agents
+// via navigator.modelContext
 // ────────────────────────────────────────────
 
-// Extend navigator with modelContext (WebMCP API)
-// navigator.modelContext.registerTool(name, schema, handler)
-// navigator.modelContext.unregisterTool(name)
+import { fetchOnion, fetchLog, getServerStatus } from './tor-fetch.mjs';
 
 // ── Internal state stores ──
 const onionCertStore = new Map();   // .onion -> { fingerprint, lastSeen, valid }
@@ -359,7 +358,43 @@ export function registerWebMCPTools() {
     getServiceStatus,
   );
 
-  console.log('[WebMCP] Registered 5 Tor hidden service tools');
+  // Tool 6: fetchOnion — proxy fetch .onion sites through this IWA's Tor circuit
+  navigator.modelContext.registerTool(
+    'fetchOnion',
+    {
+      description: 'Fetch a .onion URL through this hidden service\'s Tor circuit using Direct Sockets SOCKS5. Pass a .onion URL and get back the HTTP response. Supports optional OHTTP (Oblivious HTTP) encapsulation for additional privacy — the request is wrapped in an encrypted BHTTP envelope before traversing the Tor circuit.',
+      parameters: {
+        type: 'object',
+        properties: {
+          url: {
+            type: 'string',
+            description: 'The .onion URL to fetch (e.g. "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/")',
+          },
+          method: {
+            type: 'string',
+            enum: ['GET', 'POST', 'HEAD', 'PUT', 'DELETE'],
+            description: 'HTTP method (default: GET)',
+          },
+          headers: {
+            type: 'object',
+            description: 'Additional HTTP headers to send',
+          },
+          body: {
+            type: 'string',
+            description: 'Request body (for POST/PUT)',
+          },
+          useOHTTP: {
+            type: 'boolean',
+            description: 'Wrap the request in Oblivious HTTP (OHTTP) encapsulation for additional privacy. The request is encrypted in a BHTTP envelope using HPKE before being sent through Tor.',
+          },
+        },
+        required: ['url'],
+      },
+    },
+    fetchOnion,
+  );
+
+  console.log('[WebMCP] Registered 6 Tor hidden service tools');
   return true;
 }
 
@@ -372,9 +407,10 @@ export function unregisterWebMCPTools() {
   navigator.modelContext.unregisterTool('manageTrustedClients');
   navigator.modelContext.unregisterTool('listHolepunchSessions');
   navigator.modelContext.unregisterTool('getServiceStatus');
+  navigator.modelContext.unregisterTool('fetchOnion');
 
   console.log('[WebMCP] Unregistered Tor hidden service tools');
 }
 
 // ── Expose stores for UI consumption ──
-export { onionCertStore, trustedClients, holepunchSessions };
+export { onionCertStore, trustedClients, holepunchSessions, fetchLog, getServerStatus };
