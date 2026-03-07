@@ -4,11 +4,11 @@ import htm from './lib/htm.mjs';
 import {
   registerWebMCPTools, unregisterWebMCPTools,
   onionCertStore, trustedClients, holepunchSessions,
-  fetchLog, getServerStatus,
+  fetchLog,
 } from './webmcp.mjs';
 import {
   startHiddenServiceListener, stopHiddenServiceListener,
-  setRequestHandler,
+  setRequestHandler, getServerStatus as getTorServerStatus,
 } from './tor-fetch.mjs';
 const html = htm.bind(h);
 
@@ -83,6 +83,7 @@ const S = {
   // Hidden service state
   hsRunning: false,
   hsAddress: '',
+  hsStats: { requestCount: 0, bytesServed: 0, uptimeMs: 0, connections: 0 },
   // Vanity brute-force state
   vanityOpen: false,
   vanityPrefix: '',
@@ -93,7 +94,6 @@ const S = {
   // WebMCP state
   webmcpAvailable: false,
   webmcpEnabled: false,
-  webmcpOpen: false,
   webmcpCerts: [],
   webmcpClients: [],
   webmcpSessions: [],
@@ -993,24 +993,68 @@ function ConfigModal({ open, onClose }) {
   `;
 }
 
-function OnionIdentity({ address, running }) {
-  const display = address || 'xxxxxxxxxxxxxxxx.onion';
-  return html`
-    <div class="onion-identity ${address ? 'active' : ''}">
-      <div class="onion-glow">${display}</div>
-    </div>
-  `;
+function formatUptime(ms) {
+  if (ms <= 0) return '0s';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
 }
 
-function HiddenServiceControls({ running, address, onStart, onStop }) {
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(2) + ' MB';
+}
+
+function HiddenServiceCard({ running, address, stats, onStart, onStop }) {
+  const display = address || 'not running';
   return html`
-    <div class="hs-controls">
-      <div class="hs-label">Hidden Service</div>
-      <${OnionIdentity} address=${address} running=${running} />
-      <div class="hs-buttons">
-        <button class=${running ? 'danger' : 'primary'} onClick=${running ? onStop : onStart}>
-          ${running ? 'Stop Service' : 'Start Service'}
-        </button>
+    <div class="card hs-card">
+      <div class="card-head">
+        Hidden Service
+        <span class="hs-status-dot ${running ? 'on' : ''}"></span>
+      </div>
+      <div class="card-body hs-body">
+        <div class="hs-address-row">
+          <div class="hs-onion ${address ? 'active' : ''}">${display}</div>
+        </div>
+
+        <div class="hs-stats-grid">
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? formatUptime(stats.uptimeMs) : '--'}</div>
+            <div class="hs-stat-label">Uptime</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? stats.requestCount : '--'}</div>
+            <div class="hs-stat-label">Requests</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? formatBytes(stats.bytesServed) : '--'}</div>
+            <div class="hs-stat-label">Served</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? stats.connections : '--'}</div>
+            <div class="hs-stat-label">Connections</div>
+          </div>
+        </div>
+
+        <div class="hs-serve-info">
+          ${running ? html`
+            <div class="hs-serve-line">Listening on <span class="mono">127.0.0.1:8080</span></div>
+            <div class="hs-serve-line">Serving default HTML response page</div>
+          ` : html`
+            <div class="hs-serve-line dim">TCPServerSocket listener inactive</div>
+          `}
+        </div>
+
+        <div class="hs-buttons">
+          <button class=${running ? 'danger' : 'primary'} onClick=${running ? onStop : onStart}>
+            ${running ? 'Stop Service' : 'Start Service'}
+          </button>
+        </div>
       </div>
     </div>
   `;
@@ -1207,73 +1251,65 @@ function setupWebMCPListeners() {
   });
 }
 
-function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }) {
+function WebMCPCard({ available, enabled, onEnable, onDisable }) {
   const s = useStore();
+  const [expanded, setExpanded] = useState(false);
+
+  const toolDefs = [
+    { name: 'holepunch', desc: 'NAT holepunch to .onion targets' },
+    { name: 'validateOnionCert', desc: 'Cert fingerprint store/verify' },
+    { name: 'manageTrustedClients', desc: 'Client trust management' },
+    { name: 'listHolepunchSessions', desc: 'Active holepunch sessions' },
+    { name: 'getServiceStatus', desc: 'Hidden service status' },
+    { name: 'fetchOnion', desc: 'Fetch .onion via SOCKS5 + OHTTP' },
+  ];
 
   return html`
-    <div class="webmcp-section ${open ? 'open' : ''}">
-      <div class="webmcp-toggle" onClick=${onToggle}>
-        <span class="arr">\u25B6</span>
-        <span>WebMCP Tools</span>
+    <div class="card webmcp-card">
+      <div class="card-head">
+        WebMCP
         <span class="webmcp-badge ${enabled ? 'active' : ''}">${enabled ? 'ACTIVE' : available ? 'READY' : 'N/A'}</span>
       </div>
-      ${open && html`
-        <div class="webmcp-body">
-          <div class="webmcp-status-row">
-            <span class="webmcp-label">navigator.modelContext</span>
-            <span class="webmcp-val ${available ? 'ok' : 'dim'}">${available ? 'Available' : 'Not detected'}</span>
-          </div>
+      <div class="card-body webmcp-card-body">
+        <div class="webmcp-status-row">
+          <span class="webmcp-label">navigator.modelContext</span>
+          <span class="webmcp-val ${available ? 'ok' : 'dim'}">${available ? 'Detected' : 'Not detected'}</span>
+        </div>
 
-          <div class="webmcp-actions">
-            ${!enabled && html`
-              <button class="primary" onClick=${onEnable} disabled=${!available}>
-                Register Tools
-              </button>
-            `}
-            ${enabled && html`
-              <button class="danger" onClick=${onDisable}>
-                Unregister Tools
-              </button>
-            `}
-          </div>
-
+        <div class="webmcp-actions">
+          ${!enabled && html`
+            <button class="primary" onClick=${onEnable} disabled=${!available}>Register 6 Tools</button>
+          `}
           ${enabled && html`
-            <div class="webmcp-tools-list">
-              <div class="webmcp-tool-head">Registered Tools</div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">holepunch</span>
-                <span class="webmcp-tool-desc">NAT holepunch to .onion targets</span>
-              </div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">validateOnionCert</span>
-                <span class="webmcp-tool-desc">Cert fingerprint store/verify</span>
-              </div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">manageTrustedClients</span>
-                <span class="webmcp-tool-desc">Client trust management</span>
-              </div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">listHolepunchSessions</span>
-                <span class="webmcp-tool-desc">View holepunch sessions</span>
-              </div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">getServiceStatus</span>
-                <span class="webmcp-tool-desc">Hidden service status</span>
-              </div>
-              <div class="webmcp-tool-item">
-                <span class="webmcp-tool-name">fetchOnion</span>
-                <span class="webmcp-tool-desc">Fetch .onion via SOCKS5 + OHTTP</span>
-              </div>
-            </div>
+            <button class="danger" onClick=${onDisable}>Unregister</button>
+          `}
+        </div>
 
+        ${enabled && html`
+          <div class="webmcp-tools-grid">
+            ${toolDefs.map(t => html`
+              <div class="webmcp-tool-chip" key=${t.name}>
+                <span class="webmcp-chip-name">${t.name}</span>
+                <span class="webmcp-chip-desc">${t.desc}</span>
+              </div>
+            `)}
+          </div>
+
+          <div class="webmcp-data-toggle" onClick=${() => setExpanded(!expanded)}>
+            <span class="arr">${expanded ? '\u25BC' : '\u25B6'}</span>
+            <span>Live Data</span>
+            <span class="webmcp-data-counts">
+              ${s.webmcpCerts.length} certs \u00b7 ${s.webmcpClients.length} clients \u00b7 ${s.webmcpSessions.length} sessions \u00b7 ${fetchLog.length} fetches
+            </span>
+          </div>
+
+          ${expanded && html`
             <div class="webmcp-stores">
               <div class="webmcp-store">
                 <div class="webmcp-store-head">
                   Onion Certs <span class="webmcp-count">${s.webmcpCerts.length}</span>
                 </div>
-                ${s.webmcpCerts.length === 0 && html`
-                  <div class="webmcp-empty">No certificates stored</div>
-                `}
+                ${s.webmcpCerts.length === 0 && html`<div class="webmcp-empty">No certificates stored</div>`}
                 ${s.webmcpCerts.map(c => html`
                   <div class="webmcp-store-row" key=${c.onionAddress}>
                     <span class="webmcp-addr">${c.onionAddress.slice(0, 20)}...</span>
@@ -1281,14 +1317,11 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
                   </div>
                 `)}
               </div>
-
               <div class="webmcp-store">
                 <div class="webmcp-store-head">
                   Trusted Clients <span class="webmcp-count">${s.webmcpClients.length}</span>
                 </div>
-                ${s.webmcpClients.length === 0 && html`
-                  <div class="webmcp-empty">No trusted clients</div>
-                `}
+                ${s.webmcpClients.length === 0 && html`<div class="webmcp-empty">No trusted clients</div>`}
                 ${s.webmcpClients.map(c => html`
                   <div class="webmcp-store-row" key=${c.clientId}>
                     <span class="webmcp-client-name">${c.name}</span>
@@ -1296,14 +1329,11 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
                   </div>
                 `)}
               </div>
-
               <div class="webmcp-store">
                 <div class="webmcp-store-head">
                   Holepunch Sessions <span class="webmcp-count">${s.webmcpSessions.length}</span>
                 </div>
-                ${s.webmcpSessions.length === 0 && html`
-                  <div class="webmcp-empty">No sessions</div>
-                `}
+                ${s.webmcpSessions.length === 0 && html`<div class="webmcp-empty">No sessions</div>`}
                 ${s.webmcpSessions.map(sess => html`
                   <div class="webmcp-store-row" key=${sess.id}>
                     <span class="webmcp-addr">${sess.target.slice(0, 20)}...</span>
@@ -1311,14 +1341,11 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
                   </div>
                 `)}
               </div>
-
               <div class="webmcp-store">
                 <div class="webmcp-store-head">
-                  Fetch Proxy Log <span class="webmcp-count">${fetchLog.length}</span>
+                  Fetch Log <span class="webmcp-count">${fetchLog.length}</span>
                 </div>
-                ${fetchLog.length === 0 && html`
-                  <div class="webmcp-empty">No fetch requests yet</div>
-                `}
+                ${fetchLog.length === 0 && html`<div class="webmcp-empty">No fetch requests yet</div>`}
                 ${fetchLog.slice(-5).reverse().map((entry, i) => html`
                   <div class="webmcp-store-row" key=${i}>
                     <span class="webmcp-addr">${entry.url ? entry.url.slice(0, 30) + '...' : entry.action || '-'}</span>
@@ -1328,8 +1355,8 @@ function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }
               </div>
             </div>
           `}
-        </div>
-      `}
+        `}
+      </div>
     </div>
   `;
 }
@@ -1431,8 +1458,6 @@ function App() {
 
   const toggleVanity = useCallback(() => { S.vanityOpen = !S.vanityOpen; emit(); }, []);
 
-  const toggleWebMCP = useCallback(() => { S.webmcpOpen = !S.webmcpOpen; emit(); }, []);
-
   const enableWebMCP = useCallback(() => {
     const ok = registerWebMCPTools();
     if (ok) {
@@ -1451,7 +1476,7 @@ function App() {
     emit();
   }, []);
 
-  // Detect WebMCP availability on mount
+  // Detect WebMCP availability + poll HS stats
   useEffect(() => {
     S.webmcpAvailable = !!navigator.modelContext;
     if (S.webmcpAvailable) {
@@ -1459,6 +1484,21 @@ function App() {
     }
     setupWebMCPListeners();
     emit();
+
+    // Poll hidden service stats every second
+    const hsInterval = setInterval(() => {
+      if (S.hsRunning) {
+        const st = getTorServerStatus();
+        S.hsStats = {
+          requestCount: st.requestCount,
+          bytesServed: st.bytesServed,
+          uptimeMs: st.uptimeMs,
+          connections: st.connections,
+        };
+        refreshWebMCPState();
+      }
+    }, 1000);
+    return () => clearInterval(hsInterval);
   }, []);
 
   return html`
@@ -1487,38 +1527,38 @@ function App() {
     <${BootstrapProgress} pct=${s.bootstrap.pct} step=${s.bootstrap.step} />
 
     <main>
-      <div class="dash">
-        <div class="card throughput-card ${s.vanityOpen ? 'hidden-by-vanity' : ''}">
-          <div class="card-head">Throughput</div>
-          <div class="card-body">
-            <${Tachometer} speed=${s.speed.down} />
-          </div>
-        </div>
+      <div class="dash dash-top">
         <div class="card circuit-card">
           <div class="card-head">Circuit</div>
           <div class="card-body circuit-body">
             <${NetworkDiagram} circuit=${s.circuit} status=${s.status} />
           </div>
         </div>
+        <${HiddenServiceCard}
+          running=${s.hsRunning}
+          address=${s.hsAddress}
+          stats=${s.hsStats}
+          onStart=${startHS}
+          onStop=${stopHS}
+        />
+      </div>
+
+      <div class="dash dash-bottom">
+        <${WebMCPCard}
+          available=${s.webmcpAvailable}
+          enabled=${s.webmcpEnabled}
+          onEnable=${enableWebMCP}
+          onDisable=${disableWebMCP}
+        />
+        <div class="card throughput-card ${s.vanityOpen ? 'hidden-by-vanity' : ''}">
+          <div class="card-head">Throughput</div>
+          <div class="card-body">
+            <${Tachometer} speed=${s.speed.down} />
+          </div>
+        </div>
       </div>
 
       <${VanityBruteForce} open=${s.vanityOpen} onToggle=${toggleVanity} />
-
-      <${WebMCPPanel}
-        open=${s.webmcpOpen}
-        onToggle=${toggleWebMCP}
-        available=${s.webmcpAvailable}
-        enabled=${s.webmcpEnabled}
-        onEnable=${enableWebMCP}
-        onDisable=${disableWebMCP}
-      />
-
-      <${HiddenServiceControls}
-        running=${s.hsRunning}
-        address=${s.hsAddress}
-        onStart=${startHS}
-        onStop=${stopHS}
-      />
 
       <${LogViewer} logs=${s.logs} dotOn=${s.logDotOn} />
     </main>

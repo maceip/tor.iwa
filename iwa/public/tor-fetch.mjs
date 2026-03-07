@@ -353,6 +353,9 @@ let _serverSocket = null;
 let _serverRunning = false;
 const _serverConnections = [];
 let _requestHandler = defaultHandler;
+let _hsStartTime = 0;
+let _hsRequestCount = 0;
+let _hsBytesServed = 0;
 
 export function setRequestHandler(fn) {
   _requestHandler = fn;
@@ -440,9 +443,12 @@ async function handleConnection(connection) {
     }
     httpResp += '\r\n';
 
-    await writer.write(encoder.encode(httpResp));
+    const headerBytes = encoder.encode(httpResp);
+    await writer.write(headerBytes);
     await writer.write(bodyBytes);
     await writer.close();
+    _hsRequestCount++;
+    _hsBytesServed += headerBytes.length + bodyBytes.length;
   } catch (e) {
     // Connection handling error — ignore
   }
@@ -460,6 +466,9 @@ export async function startHiddenServiceListener(port = 8080) {
   _serverSocket = new TCPServerSocket('127.0.0.1', { localPort: port });
   const { readable } = await _serverSocket.opened;
   _serverRunning = true;
+  _hsStartTime = Date.now();
+  _hsRequestCount = 0;
+  _hsBytesServed = 0;
 
   // Accept connections in background
   const reader = readable.getReader();
@@ -494,5 +503,8 @@ export function getServerStatus() {
     running: _serverRunning,
     connections: _serverConnections.length,
     recentConnections: _serverConnections.slice(-10),
+    requestCount: _hsRequestCount,
+    bytesServed: _hsBytesServed,
+    uptimeMs: _serverRunning ? Date.now() - _hsStartTime : 0,
   };
 }
