@@ -191,6 +191,67 @@ try {
     }
   }
 
+  // ── Test hidden service start ──
+  if (bootstrapPercent >= 100 && !hasError) {
+    console.log('\n=== Testing Hidden Service ===');
+
+    // Click "Start Service" button
+    const hsClicked = await page.evaluate(() => {
+      for (const b of document.querySelectorAll('button')) {
+        if (b.textContent.includes('Start Service')) { b.click(); return true; }
+      }
+      return false;
+    });
+    console.log('HS Start clicked:', hsClicked);
+
+    // Wait for HS to initialize
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Check if .onion address was generated
+    const hsStatus = await page.evaluate(() => {
+      const glow = document.querySelector('.onion-glow');
+      const text = glow ? glow.textContent : '';
+      return {
+        address: text,
+        hasOnion: text.endsWith('.onion') && text.length > 20,
+      };
+    });
+    console.log('HS Address:', hsStatus.address);
+    console.log('HS Valid:  ', hsStatus.hasOnion);
+
+    if (!hsStatus.hasOnion) {
+      onLog('test', 'FAIL: Hidden service did not generate .onion address');
+      hasError = true;
+    }
+
+    // Check TCPServerSocket listener status from logs
+    const hsLogs = logs.filter(l =>
+      l.text.includes('TCPServerSocket') || l.text.includes('Hidden service')
+    );
+    console.log(`HS Logs:    ${hsLogs.length}`);
+    hsLogs.forEach(l => console.log(`  [${l.source}] ${l.text}`));
+
+    // ── Test WebMCP tool availability ──
+    console.log('\n=== Testing WebMCP ===');
+    const webmcpStatus = await page.evaluate(() => {
+      return {
+        modelContextAvailable: !!navigator.modelContext,
+        directSocketsAvailable: typeof TCPSocket !== 'undefined',
+        serverSocketAvailable: typeof TCPServerSocket !== 'undefined',
+      };
+    });
+    console.log('modelContext:', webmcpStatus.modelContextAvailable);
+    console.log('TCPSocket:  ', webmcpStatus.directSocketsAvailable);
+    console.log('TCPServerSocket:', webmcpStatus.serverSocketAvailable);
+
+    if (!webmcpStatus.directSocketsAvailable) {
+      console.log('WARN: TCPSocket not available (expected in IWA context)');
+    }
+    if (!webmcpStatus.serverSocketAvailable) {
+      console.log('WARN: TCPServerSocket not available (expected in IWA context)');
+    }
+  }
+
   console.log(`\n=== Summary ===`);
   console.log(`Duration:   ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
   console.log(`Bootstrap:  ${bootstrapPercent}%`);

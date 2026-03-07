@@ -24,5 +24,33 @@
     "cross-origin-isolated": ["self"],
     "direct-sockets": ["self"],
     "direct-sockets-private": ["self"]
+  },
+  "webmcp": {
+    "tools": [
+      {
+        "name": "holepunch",
+        "description": "Establish peer-to-peer connections to other .onion hidden services via SOCKS5 Direct Sockets. Supports connect/send/receive/close for bidirectional AI-to-AI communication over Tor."
+      },
+      {
+        "name": "validateOnionCert",
+        "description": "TOFU certificate management for .onion services. Auto-captures fingerprints on fetch, detects identity changes. Actions: check, store, list, remove, trust, untrust."
+      },
+      {
+        "name": "manageTrustedClients",
+        "description": "Access control for this hidden service. When active, only clients with a valid X-Client-ID can connect. Actions: add, remove, list, verify, clear."
+      },
+      {
+        "name": "listHolepunchSessions",
+        "description": "List all holepunch sessions with connection status, message counts, and byte statistics."
+      },
+      {
+        "name": "getServiceStatus",
+        "description": "Comprehensive hidden service status: uptime, request stats, access control state, cert store health, active peer sessions."
+      },
+      {
+        "name": "fetchOnion",
+        "description": "Fetch .onion URLs through this IWA's Tor circuit via SOCKS5. Returns HTTP response with TOFU cert verification. Optional OHTTP encapsulation for additional privacy."
+      }
+    ]
   }
 }

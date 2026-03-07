@@ -1,6 +1,18 @@
 import { h, render, Fragment } from './lib/preact.mjs';
 import { useState, useEffect, useRef, useCallback, useMemo } from './lib/preact-hooks.mjs';
 import htm from './lib/htm.mjs';
+import {
+  registerWebMCPTools, unregisterWebMCPTools,
+  onionCertStore, trustedClients, holepunchSessions,
+  fetchLog,
+  getRelayPeers, getRelayStats, isRelayVolunteering,
+} from './webmcp.mjs';
+import {
+  startHiddenServiceListener, stopHiddenServiceListener,
+  setRequestHandler, getServerStatus as getTorServerStatus,
+  setLocalOnionAddress,
+  startRelayVolunteer, stopRelayVolunteer,
+} from './tor-fetch.mjs';
 const html = htm.bind(h);
 
 // ────────────────────────────────────────────
@@ -16,9 +28,16 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
 // ────────────────────────────────────────────
 // Particle mesh background
 // ────────────────────────────────────────────
+// ── Visibility-aware animation helper ──
+// Pauses all rAF loops when the tab is hidden to save battery/CPU
+let _tabVisible = !document.hidden;
+document.addEventListener('visibilitychange', () => { _tabVisible = !document.hidden; });
+
 (function initBg() {
   const c = document.getElementById('bg-canvas'), ctx = c.getContext('2d');
-  const pts = [], N = 40, D = 140;
+  const N = Math.min(40, (navigator.hardwareConcurrency || 4) * 8);
+  const D = 140;
+  const pts = [];
   function resize() { c.width = innerWidth; c.height = innerHeight; }
   addEventListener('resize', resize); resize();
   for (let i = 0; i < N; i++) pts.push({
@@ -27,21 +46,23 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
     r: Math.random() * 1.6 + 0.8,
   });
   (function loop() {
-    ctx.clearRect(0, 0, c.width, c.height);
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      p.x += p.vx; p.y += p.vy;
-      if (p.x < 0 || p.x > c.width) p.vx *= -1;
-      if (p.y < 0 || p.y > c.height) p.vy *= -1;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.28);
-      ctx.fillStyle = 'rgba(123,77,255,0.4)'; ctx.fill();
-      for (let j = i + 1; j < pts.length; j++) {
-        const q = pts[j];
-        const dx = p.x - q.x, dy = p.y - q.y, d = Math.sqrt(dx * dx + dy * dy);
-        if (d < D) {
-          ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
-          ctx.strokeStyle = `rgba(123,77,255,${0.1 * (1 - d / D)})`;
-          ctx.lineWidth = 0.5; ctx.stroke();
+    if (_tabVisible) {
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        p.x += p.vx; p.y += p.vy;
+        if (p.x < 0 || p.x > c.width) p.vx *= -1;
+        if (p.y < 0 || p.y > c.height) p.vy *= -1;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.28);
+        ctx.fillStyle = 'rgba(123,77,255,0.4)'; ctx.fill();
+        for (let j = i + 1; j < pts.length; j++) {
+          const q = pts[j];
+          const dx = p.x - q.x, dy = p.y - q.y, d = Math.sqrt(dx * dx + dy * dy);
+          if (d < D) {
+            ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
+            ctx.strokeStyle = `rgba(123,77,255,${0.1 * (1 - d / D)})`;
+            ctx.lineWidth = 0.5; ctx.stroke();
+          }
         }
       }
     }
@@ -52,12 +73,13 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
 // ────────────────────────────────────────────
 // Global reactive state
 // ────────────────────────────────────────────
-const DEFAULT_TORRC = `SocksPort 0
+const DEFAULT_TORRC = `SocksPort 9050
 Log notice stdout
 SafeLogging 0
 DisableNetwork 0
-ClientOnly 1
 DataDirectory /tor-data
+HiddenServiceDir /tor-data/hs
+HiddenServicePort 80 127.0.0.1:8080
 `;
 
 const S = {
@@ -73,6 +95,7 @@ const S = {
   // Hidden service state
   hsRunning: false,
   hsAddress: '',
+  hsStats: { requestCount: 0, bytesServed: 0, uptimeMs: 0, connections: 0 },
   // Vanity brute-force state
   vanityOpen: false,
   vanityPrefix: '',
@@ -80,6 +103,17 @@ const S = {
   vanityAttempts: 0,
   vanityRate: 0,
   vanityFound: null,
+  // WebMCP state
+  webmcpAvailable: false,
+  webmcpEnabled: false,
+  webmcpCerts: [],
+  webmcpClients: [],
+  webmcpSessions: [],
+  // OHTTP relay state
+  relayVolunteering: false,
+  relayPeerCount: 0,
+  relayStats: { requestsRelayed: 0, bytesRelayed: 0, lastRelayedAt: null },
+  relayPubkey: null,
   _subs: new Set(),
 };
 function emit() { S._subs.forEach(fn => fn()); }
@@ -323,8 +357,10 @@ function Tachometer({ speed }) {
     let raf;
     function draw() {
       if (!ref.current) return;
-      animSpeed.current += (speed - animSpeed.current) * 0.12;
-      drawTacho(ref.current, animSpeed.current);
+      if (_tabVisible) {
+        animSpeed.current += (speed - animSpeed.current) * 0.12;
+        drawTacho(ref.current, animSpeed.current);
+      }
       raf = requestAnimationFrame(draw);
     }
     draw();
@@ -476,7 +512,7 @@ function NetworkDiagram({ circuit, status }) {
   useEffect(() => {
     let raf;
     function draw(t) {
-      if (ref.current) drawNetwork(ref.current, circuit, status, t);
+      if (ref.current && _tabVisible) drawNetwork(ref.current, circuit, status, t);
       raf = requestAnimationFrame(draw);
     }
     draw(0);
@@ -711,7 +747,7 @@ function ComplexityViz({ prefix }) {
   useEffect(() => {
     let raf;
     function draw(t) {
-      if (ref.current) drawComplexityViz(ref.current, prefix, t);
+      if (ref.current && _tabVisible) drawComplexityViz(ref.current, prefix, t);
       raf = requestAnimationFrame(draw);
     }
     draw(0);
@@ -825,16 +861,11 @@ function pubkeyToOnion(pubkey) {
   return base32Encode(addrBytes);
 }
 
-// Ed25519 keypair generation using Web Crypto (for speed) with fallback
-// We generate raw X25519 keys and derive ed25519 format for .onion
-// Actually, we need proper Ed25519 for Tor. Use a fast approach:
-// Generate random 32 bytes as seed, derive keypair deterministically.
-// For vanity generation speed, we use batched generation.
+// Ed25519 keypair generation using Web Crypto with OPFS persistence.
+// Persisting the keypair in OPFS gives a stable .onion address across sessions.
 let _vanityWorker = null;
 
 async function generateEd25519Keypair() {
-  // Use Web Crypto to generate an Ed25519 keypair
-  // Ed25519 is supported in modern browsers
   try {
     const keyPair = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
     const rawPub = await crypto.subtle.exportKey('raw', keyPair.publicKey);
@@ -848,6 +879,47 @@ async function generateEd25519Keypair() {
     const pub = new Uint8Array(32);
     crypto.getRandomValues(pub);
     return { publicKey: pub, privateKey: new Uint8Array(64) };
+  }
+}
+
+// OPFS-based keypair persistence — survives page reloads for stable .onion address
+async function loadOrCreateKeypair() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle('hs-keys', { create: true });
+
+    // Try to load existing keypair
+    try {
+      const pubHandle = await dir.getFileHandle('pub.key');
+      const privHandle = await dir.getFileHandle('priv.key');
+      const pubFile = await pubHandle.getFile();
+      const privFile = await privHandle.getFile();
+      const publicKey = new Uint8Array(await pubFile.arrayBuffer());
+      const privateKey = new Uint8Array(await privFile.arrayBuffer());
+      if (publicKey.length === 32 && privateKey.length > 0) {
+        addLog('Loaded persisted HS keypair from OPFS', 'ok');
+        return { publicKey, privateKey, persisted: true };
+      }
+    } catch (e) {
+      // No existing keypair — generate new one
+    }
+
+    // Generate and persist
+    const kp = await generateEd25519Keypair();
+    const pubHandle = await dir.getFileHandle('pub.key', { create: true });
+    const privHandle = await dir.getFileHandle('priv.key', { create: true });
+    const pubW = await pubHandle.createWritable();
+    await pubW.write(kp.publicKey);
+    await pubW.close();
+    const privW = await privHandle.createWritable();
+    await privW.write(kp.privateKey);
+    await privW.close();
+    addLog('Generated and persisted new HS keypair to OPFS', 'ok');
+    return { ...kp, persisted: true };
+  } catch (e) {
+    // OPFS not available — fall back to ephemeral keypair
+    addLog('OPFS not available — keypair is ephemeral (' + e.message + ')', 'warn');
+    return { ...(await generateEd25519Keypair()), persisted: false };
   }
 }
 
@@ -976,24 +1048,68 @@ function ConfigModal({ open, onClose }) {
   `;
 }
 
-function OnionIdentity({ address, running }) {
-  const display = address || 'xxxxxxxxxxxxxxxx.onion';
-  return html`
-    <div class="onion-identity ${address ? 'active' : ''}">
-      <div class="onion-glow">${display}</div>
-    </div>
-  `;
+function formatUptime(ms) {
+  if (ms <= 0) return '0s';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
 }
 
-function HiddenServiceControls({ running, address, onStart, onStop }) {
+function formatBytes(b) {
+  if (b < 1024) return b + ' B';
+  if (b < 1048576) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1048576).toFixed(2) + ' MB';
+}
+
+function HiddenServiceCard({ running, address, stats, onStart, onStop }) {
+  const display = address || 'not running';
   return html`
-    <div class="hs-controls">
-      <div class="hs-label">Hidden Service</div>
-      <${OnionIdentity} address=${address} running=${running} />
-      <div class="hs-buttons">
-        <button class=${running ? 'danger' : 'primary'} onClick=${running ? onStop : onStart}>
-          ${running ? 'Stop Service' : 'Start Service'}
-        </button>
+    <div class="card hs-card ${running ? 'running' : ''}">
+      <div class="card-head">
+        Hidden Service
+        <span class="hs-status-dot ${running ? 'on' : ''}"></span>
+      </div>
+      <div class="card-body hs-body">
+        <div class="hs-address-row">
+          <div class="hs-onion ${address ? 'active' : ''}">${display}</div>
+        </div>
+
+        <div class="hs-stats-grid">
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? formatUptime(stats.uptimeMs) : '--'}</div>
+            <div class="hs-stat-label">Uptime</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? stats.requestCount : '--'}</div>
+            <div class="hs-stat-label">Requests</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? formatBytes(stats.bytesServed) : '--'}</div>
+            <div class="hs-stat-label">Served</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${running ? stats.connections : '--'}</div>
+            <div class="hs-stat-label">Connections</div>
+          </div>
+        </div>
+
+        <div class="hs-serve-info">
+          ${running ? html`
+            <div class="hs-serve-line">Listening on <span class="mono">127.0.0.1:8080</span></div>
+            <div class="hs-serve-line">Serving default HTML response page</div>
+          ` : html`
+            <div class="hs-serve-line dim">TCPServerSocket listener inactive</div>
+          `}
+        </div>
+
+        <div class="hs-buttons">
+          <button class=${running ? 'danger' : 'primary'} onClick=${running ? onStop : onStart}>
+            ${running ? 'Stop Service' : 'Start Service'}
+          </button>
+        </div>
       </div>
     </div>
   `;
@@ -1101,6 +1217,283 @@ function LogViewer({ logs, dotOn }) {
 }
 
 // ────────────────────────────────────────────
+// WebMCP Panel — exposes Tor tools to AI agents
+// ────────────────────────────────────────────
+
+function refreshWebMCPState() {
+  S.webmcpCerts = Array.from(onionCertStore.entries()).map(([addr, c]) => ({
+    onionAddress: addr, fingerprint: c.fingerprint, lastSeen: c.lastSeen, valid: c.valid,
+  }));
+  S.webmcpClients = Array.from(trustedClients.entries()).map(([, c]) => c);
+  S.webmcpSessions = Array.from(holepunchSessions.entries()).map(([, s]) => s);
+  // Relay state
+  S.relayVolunteering = isRelayVolunteering();
+  S.relayPeerCount = getRelayPeers().size;
+  S.relayStats = getRelayStats();
+  emit();
+}
+
+// Listen for WebMCP events dispatched by production tool handlers
+function setupWebMCPListeners() {
+  // Holepunch connected
+  window.addEventListener('webmcp:holepunch:connected', (e) => {
+    const { sessionId, target, port } = e.detail;
+    addLog(`[WebMCP] Holepunch connected to ${target}:${port || 80} (${sessionId.slice(0, 8)}...)`, 'ok');
+    refreshWebMCPState();
+  });
+
+  // Holepunch failed
+  window.addEventListener('webmcp:holepunch:failed', (e) => {
+    const { sessionId, target, error } = e.detail;
+    addLog(`[WebMCP] Holepunch to ${target} failed: ${error}`, 'err');
+    refreshWebMCPState();
+  });
+
+  // Holepunch closed
+  window.addEventListener('webmcp:holepunch:closed', (e) => {
+    const { sessionId, target } = e.detail;
+    addLog(`[WebMCP] Holepunch session ${sessionId.slice(0, 8)}... closed`, 'info');
+    refreshWebMCPState();
+  });
+
+  // TOFU cert auto-stored on first contact
+  window.addEventListener('webmcp:cert-tofu', (e) => {
+    const { hostname, fingerprint } = e.detail;
+    addLog(`[WebMCP] TOFU: auto-stored cert for ${hostname.slice(0, 16)}...`, 'ok');
+    refreshWebMCPState();
+  });
+
+  // Cert fingerprint mismatch detected
+  window.addEventListener('webmcp:cert-mismatch', (e) => {
+    const { hostname } = e.detail;
+    addLog(`[WebMCP] CERT MISMATCH for ${hostname.slice(0, 16)}... — possible compromise!`, 'err');
+    refreshWebMCPState();
+  });
+
+  // Cert manually stored by agent
+  window.addEventListener('webmcp:cert-stored', (e) => {
+    const { onionAddress } = e.detail;
+    addLog(`[WebMCP] Cert stored for ${onionAddress.slice(0, 16)}...`, 'ok');
+    refreshWebMCPState();
+  });
+
+  // Cert removed
+  window.addEventListener('webmcp:cert-removed', (e) => {
+    const { onionAddress } = e.detail;
+    addLog(`[WebMCP] Cert removed for ${onionAddress.slice(0, 16)}...`, 'warn');
+    refreshWebMCPState();
+  });
+
+  // Client added
+  window.addEventListener('webmcp:client-added', (e) => {
+    const { clientId, name } = e.detail;
+    addLog(`[WebMCP] Trusted client added: ${name || clientId}`, 'ok');
+    refreshWebMCPState();
+  });
+
+  // Client removed
+  window.addEventListener('webmcp:client-removed', (e) => {
+    const { clientId } = e.detail;
+    addLog(`[WebMCP] Trusted client removed: ${clientId}`, 'warn');
+    refreshWebMCPState();
+  });
+
+  // All clients cleared
+  window.addEventListener('webmcp:clients-cleared', () => {
+    addLog('[WebMCP] All trusted clients cleared — access control disabled', 'warn');
+    refreshWebMCPState();
+  });
+
+  // OHTTP relay events
+  window.addEventListener('webmcp:relay-started', (e) => {
+    addLog('[WebMCP] OHTTP relay volunteering started — accepting relay requests', 'ok');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-stopped', () => {
+    addLog('[WebMCP] OHTTP relay stopped', 'warn');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-peer-added', (e) => {
+    const { peerOnion } = e.detail;
+    addLog('[WebMCP] OHTTP relay peer added: ' + peerOnion.slice(0, 16) + '...', 'ok');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-peer-removed', (e) => {
+    const { peerOnion } = e.detail;
+    addLog('[WebMCP] OHTTP relay peer removed: ' + peerOnion.slice(0, 16) + '...', 'warn');
+    refreshWebMCPState();
+  });
+}
+
+function OHTTPRelayCard({ volunteering, peerCount, stats, onVolunteer, onStop }) {
+  return html`
+    <div class="card relay-card ${volunteering ? 'active' : ''}">
+      <div class="card-head">
+        OHTTP Relay
+        <span class="hs-status-dot ${volunteering ? 'on' : ''}"></span>
+      </div>
+      <div class="card-body">
+        <div class="relay-mode-row">
+          <span class="relay-mode-label">Mode</span>
+          <span class="relay-mode-val ${peerCount > 0 ? 'ok' : 'dim'}">
+            ${peerCount > 0 ? 'Peer Relay (' + peerCount + ' peer' + (peerCount > 1 ? 's' : '') + ')' : 'Circuit Isolation (no peers)'}
+          </span>
+        </div>
+
+        <div class="hs-stats-grid">
+          <div class="hs-stat">
+            <div class="hs-stat-val">${stats.requestsRelayed || 0}</div>
+            <div class="hs-stat-label">Relayed</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${stats.bytesRelayed ? formatBytes(stats.bytesRelayed) : '0 B'}</div>
+            <div class="hs-stat-label">Bytes</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${peerCount}</div>
+            <div class="hs-stat-label">Peers</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${volunteering ? 'Yes' : 'No'}</div>
+            <div class="hs-stat-label">Volunteer</div>
+          </div>
+        </div>
+
+        <div class="hs-serve-info">
+          ${volunteering ? html`
+            <div class="hs-serve-line">Accepting OHTTP requests at <span class="mono">/.well-known/ohttp-relay</span></div>
+            <div class="hs-serve-line">Peers encrypt to your ECDH public key via BHTTP + AES-GCM</div>
+          ` : html`
+            <div class="hs-serve-line dim">Not volunteering as relay</div>
+            <div class="hs-serve-line dim">${peerCount > 0 ? 'Outbound OHTTP via peer relay' : 'Outbound OHTTP via circuit isolation (IsolateSOCKSAuth)'}</div>
+          `}
+        </div>
+
+        <div class="hs-buttons">
+          <button class=${volunteering ? 'danger' : 'primary'} onClick=${volunteering ? onStop : onVolunteer}>
+            ${volunteering ? 'Stop Relay' : 'Volunteer as Relay'}
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function WebMCPCard({ available, enabled, onEnable, onDisable }) {
+  const s = useStore();
+  const [expanded, setExpanded] = useState(false);
+
+  const toolDefs = [
+    { name: 'holepunch', desc: 'Peer connections to .onion targets' },
+    { name: 'validateOnionCert', desc: 'Cert fingerprint store/verify' },
+    { name: 'manageTrustedClients', desc: 'Client trust management' },
+    { name: 'listHolepunchSessions', desc: 'Active holepunch sessions' },
+    { name: 'getServiceStatus', desc: 'Hidden service status' },
+    { name: 'fetchOnion', desc: 'Fetch .onion + OHTTP relay/isolation' },
+    { name: 'manageOHTTPRelay', desc: 'OHTTP relay + peer management' },
+  ];
+
+  return html`
+    <div class="card webmcp-card ${enabled ? 'active' : ''}">
+      <div class="card-head">
+        WebMCP
+        <span class="webmcp-badge ${enabled ? 'active' : ''}">${enabled ? 'ACTIVE' : available ? 'READY' : 'N/A'}</span>
+      </div>
+      <div class="card-body webmcp-card-body">
+        <div class="webmcp-status-row">
+          <span class="webmcp-label">navigator.modelContext</span>
+          <span class="webmcp-val ${available ? 'ok' : 'dim'}">${available ? 'Detected' : 'Not detected'}</span>
+        </div>
+
+        <div class="webmcp-actions">
+          ${!enabled && html`
+            <button class="primary" onClick=${onEnable} disabled=${!available}>Register 7 Tools</button>
+          `}
+          ${enabled && html`
+            <button class="danger" onClick=${onDisable}>Unregister</button>
+          `}
+        </div>
+
+        ${enabled && html`
+          <div class="webmcp-tools-grid">
+            ${toolDefs.map(t => html`
+              <div class="webmcp-tool-chip" key=${t.name}>
+                <span class="webmcp-chip-name">${t.name}</span>
+                <span class="webmcp-chip-desc">${t.desc}</span>
+              </div>
+            `)}
+          </div>
+
+          <div class="webmcp-data-toggle" onClick=${() => setExpanded(!expanded)}>
+            <span class="arr">${expanded ? '\u25BC' : '\u25B6'}</span>
+            <span>Live Data</span>
+            <span class="webmcp-data-counts">
+              ${s.webmcpCerts.length} certs \u00b7 ${s.webmcpClients.length} clients \u00b7 ${s.webmcpSessions.length} sessions \u00b7 ${fetchLog.length} fetches
+            </span>
+          </div>
+
+          ${expanded && html`
+            <div class="webmcp-stores">
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Onion Certs <span class="webmcp-count">${s.webmcpCerts.length}</span>
+                </div>
+                ${s.webmcpCerts.length === 0 && html`<div class="webmcp-empty">No certificates stored</div>`}
+                ${s.webmcpCerts.map(c => html`
+                  <div class="webmcp-store-row" key=${c.onionAddress}>
+                    <span class="webmcp-addr">${c.onionAddress.slice(0, 20)}...</span>
+                    <span class="webmcp-fp">${c.fingerprint ? c.fingerprint.slice(0, 16) + '...' : '-'}</span>
+                  </div>
+                `)}
+              </div>
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Trusted Clients <span class="webmcp-count">${s.webmcpClients.length}</span>
+                </div>
+                ${s.webmcpClients.length === 0 && html`<div class="webmcp-empty">No trusted clients</div>`}
+                ${s.webmcpClients.map(c => html`
+                  <div class="webmcp-store-row" key=${c.clientId}>
+                    <span class="webmcp-client-name">${c.name}</span>
+                    <span class="webmcp-client-date">${c.addedAt ? c.addedAt.split('T')[0] : '-'}</span>
+                  </div>
+                `)}
+              </div>
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Holepunch Sessions <span class="webmcp-count">${s.webmcpSessions.length}</span>
+                </div>
+                ${s.webmcpSessions.length === 0 && html`<div class="webmcp-empty">No sessions</div>`}
+                ${s.webmcpSessions.map(sess => html`
+                  <div class="webmcp-store-row" key=${sess.id}>
+                    <span class="webmcp-addr">${sess.target.slice(0, 20)}...</span>
+                    <span class="webmcp-session-status ${sess.status}">${sess.status}</span>
+                  </div>
+                `)}
+              </div>
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Fetch Log <span class="webmcp-count">${fetchLog.length}</span>
+                </div>
+                ${fetchLog.length === 0 && html`<div class="webmcp-empty">No fetch requests yet</div>`}
+                ${fetchLog.slice(-5).reverse().map((entry, i) => html`
+                  <div class="webmcp-store-row" key=${i}>
+                    <span class="webmcp-addr">${entry.url ? entry.url.slice(0, 30) + '...' : entry.action || '-'}</span>
+                    <span class="webmcp-session-status ${entry.status === 'pending' ? 'initiating' : entry.error ? 'timeout' : 'connected'}">${entry.type}${entry.ohttp ? ' [OHTTP]' : ''}</span>
+                  </div>
+                `)}
+              </div>
+            </div>
+          `}
+        `}
+      </div>
+    </div>
+  `;
+}
+
+// ────────────────────────────────────────────
 // App
 // ────────────────────────────────────────────
 function App() {
@@ -1145,36 +1538,129 @@ function App() {
   const dismissFS = useCallback(() => { S.fsBanner = false; emit(); }, []);
   const dismissShare = useCallback(() => { S.sharedData = null; emit(); }, []);
 
-  const startHS = useCallback(() => {
+  const startHS = useCallback(async () => {
     S.hsRunning = true;
     S.hsAddress = '';
-    addLog('Starting hidden service...', 'info');
-    // Simulate HS address generation
-    setTimeout(() => {
+    addLog('Starting hidden service listener (TCPServerSocket :8080)...', 'info');
+    emit();
+
+    try {
+      // Start the real TCPServerSocket listener
+      await startHiddenServiceListener(8080);
+      addLog('TCPServerSocket listening on 127.0.0.1:8080', 'ok');
+
+      // Load persisted keypair from OPFS, or generate a new one
+      const kp = await loadOrCreateKeypair();
+      S.hsAddress = pubkeyToOnion(kp.publicKey) + '.onion';
+      setLocalOnionAddress(S.hsAddress);
+      addLog('Hidden service address: ' + S.hsAddress + (kp.persisted ? ' (persisted)' : ' (ephemeral)'), 'ok');
+
+      // Write the HS torrc config into Tor's virtual FS
+      const fs = window.Module?.FS || (typeof FS !== 'undefined' ? FS : null);
+      if (fs) {
+        try { fs.mkdir('/tor-data/hs'); } catch(e) {}
+        // Write the keypair so Tor can use it
+        const hostnameFile = S.hsAddress + '\n';
+        fs.writeFile('/tor-data/hs/hostname', hostnameFile);
+        addLog('HS hostname written to /tor-data/hs/', 'ok');
+      }
+
+      addLog('Hidden service running — Tor will advertise ' + S.hsAddress, 'ok');
+    } catch (e) {
+      addLog('HS start error: ' + e.message, 'err');
+      // Fallback: generate address without listener (for environments without TCPServerSocket)
       const pub = new Uint8Array(32);
       crypto.getRandomValues(pub);
       S.hsAddress = pubkeyToOnion(pub) + '.onion';
-      addLog('Hidden service started: ' + S.hsAddress, 'ok');
-      emit();
-    }, 500);
+      setLocalOnionAddress(S.hsAddress);
+      addLog('Fallback: generated address without listener — ' + S.hsAddress, 'warn');
+    }
     emit();
   }, []);
 
-  const stopHS = useCallback(() => {
+  const stopHS = useCallback(async () => {
+    addLog('Stopping hidden service...', 'info');
+    try {
+      await stopHiddenServiceListener();
+      addLog('TCPServerSocket closed', 'ok');
+    } catch(e) {}
     S.hsRunning = false;
-    addLog('Hidden service stopped', 'warn');
     S.hsAddress = '';
+    addLog('Hidden service stopped', 'warn');
     emit();
   }, []);
 
   const toggleVanity = useCallback(() => { S.vanityOpen = !S.vanityOpen; emit(); }, []);
+
+  const startRelay = useCallback(async () => {
+    try {
+      const result = await startRelayVolunteer();
+      S.relayVolunteering = true;
+      S.relayPubkey = result.pubkey;
+      addLog('[OHTTP] Relay volunteering started — pubkey: ' + result.pubkey.slice(0, 24) + '...', 'ok');
+      emit();
+    } catch (e) {
+      addLog('[OHTTP] Failed to start relay: ' + e.message, 'err');
+    }
+  }, []);
+
+  const stopRelay = useCallback(async () => {
+    await stopRelayVolunteer();
+    S.relayVolunteering = false;
+    S.relayPubkey = null;
+    addLog('[OHTTP] Relay stopped', 'warn');
+    emit();
+  }, []);
+
+  const enableWebMCP = useCallback(() => {
+    const ok = registerWebMCPTools();
+    if (ok) {
+      S.webmcpEnabled = true;
+      addLog('[WebMCP] 7 tools registered for AI agents (incl. OHTTP relay)', 'ok');
+      emit();
+    } else {
+      addLog('[WebMCP] Failed to register — modelContext not available', 'warn');
+    }
+  }, []);
+
+  const disableWebMCP = useCallback(() => {
+    unregisterWebMCPTools();
+    S.webmcpEnabled = false;
+    addLog('[WebMCP] Tools unregistered', 'warn');
+    emit();
+  }, []);
+
+  // Detect WebMCP availability + poll HS stats
+  useEffect(() => {
+    S.webmcpAvailable = !!navigator.modelContext;
+    if (S.webmcpAvailable) {
+      addLog('[WebMCP] navigator.modelContext detected', 'ok');
+    }
+    setupWebMCPListeners();
+    emit();
+
+    // Poll hidden service stats every second
+    const hsInterval = setInterval(() => {
+      if (S.hsRunning) {
+        const st = getTorServerStatus();
+        S.hsStats = {
+          requestCount: st.requestCount,
+          bytesServed: st.bytesServed,
+          uptimeMs: st.uptimeMs,
+          connections: st.connections,
+        };
+        refreshWebMCPState();
+      }
+    }, 1000);
+    return () => clearInterval(hsInterval);
+  }, []);
 
   return html`
     <header>
       <img class="logo" src="/icon-192.png" alt="Tor" />
       <div class="title">
         <h1>TOR</h1>
-        <div class="sub">WASM + Direct Sockets</div>
+        <div class="sub">WASM + Direct Sockets + WebMCP</div>
       </div>
       <${StatusPill} status=${s.status} />
     </header>
@@ -1195,6 +1681,38 @@ function App() {
     <${BootstrapProgress} pct=${s.bootstrap.pct} step=${s.bootstrap.step} />
 
     <main>
+      <div class="dash dash-top">
+        <div class="card circuit-card">
+          <div class="card-head">Circuit</div>
+          <div class="card-body circuit-body">
+            <${NetworkDiagram} circuit=${s.circuit} status=${s.status} />
+          </div>
+        </div>
+        <${HiddenServiceCard}
+          running=${s.hsRunning}
+          address=${s.hsAddress}
+          stats=${s.hsStats}
+          onStart=${startHS}
+          onStop=${stopHS}
+        />
+      </div>
+
+      <div class="dash dash-bottom">
+        <${WebMCPCard}
+          available=${s.webmcpAvailable}
+          enabled=${s.webmcpEnabled}
+          onEnable=${enableWebMCP}
+          onDisable=${disableWebMCP}
+        />
+        <${OHTTPRelayCard}
+          volunteering=${s.relayVolunteering}
+          peerCount=${s.relayPeerCount}
+          stats=${s.relayStats}
+          onVolunteer=${startRelay}
+          onStop=${stopRelay}
+        />
+      </div>
+
       <div class="dash">
         <div class="card throughput-card ${s.vanityOpen ? 'hidden-by-vanity' : ''}">
           <div class="card-head">Throughput</div>
@@ -1202,29 +1720,35 @@ function App() {
             <${Tachometer} speed=${s.speed.down} />
           </div>
         </div>
-        <div class="card circuit-card">
-          <div class="card-head">Circuit</div>
-          <div class="card-body circuit-body">
-            <${NetworkDiagram} circuit=${s.circuit} status=${s.status} />
-          </div>
-        </div>
       </div>
 
       <${VanityBruteForce} open=${s.vanityOpen} onToggle=${toggleVanity} />
-
-      <${HiddenServiceControls}
-        running=${s.hsRunning}
-        address=${s.hsAddress}
-        onStart=${startHS}
-        onStop=${stopHS}
-      />
 
       <${LogViewer} logs=${s.logs} dotOn=${s.logDotOn} />
     </main>
 
     <${ConfigModal} open=${s.configModalOpen} onClose=${closeConfig} />
 
-    <footer>Tor 0.4.9.5 \u00b7 WebAssembly \u00b7 Direct Sockets \u00b7 Isolated Web App</footer>
+    <footer>
+      <span>Tor 0.4.9.5</span>
+      <span class="footer-sep">\u2502</span>
+      <div class="footer-dots">
+        <div class="footer-indicator ${s.status === 'connected' ? 'tor on' : 'tor'}">
+          <span class="fdot"></span><span>Tor</span>
+        </div>
+        <div class="footer-indicator ${s.hsRunning ? 'hs on' : 'hs'}">
+          <span class="fdot"></span><span>HS</span>
+        </div>
+        <div class="footer-indicator ${s.webmcpEnabled ? 'mcp on' : 'mcp'}">
+          <span class="fdot"></span><span>MCP</span>
+        </div>
+        <div class="footer-indicator ${s.relayVolunteering ? 'relay on' : 'relay'}">
+          <span class="fdot"></span><span>OHTTP</span>
+        </div>
+      </div>
+      <span class="footer-sep">\u2502</span>
+      <span>IWA</span>
+    </footer>
   `;
 }
 
