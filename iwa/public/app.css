@@ -340,6 +340,97 @@ main { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; 
   font-size: 9px; color: var(--green);
 }
 
+/* ── WebMCP Panel ── */
+.webmcp-section {
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  overflow: hidden;
+}
+.webmcp-toggle {
+  padding: 8px 12px; font-size: 9px; color: var(--text-dim); cursor: pointer;
+  display: flex; align-items: center; gap: 6px; user-select: none;
+  transition: color 0.15s; letter-spacing: 1px; text-transform: uppercase;
+}
+.webmcp-toggle:hover { color: var(--text); }
+.webmcp-toggle .arr { transition: transform 0.25s var(--ease); font-size: 9px; }
+.webmcp-section.open .webmcp-toggle .arr { transform: rotate(90deg); }
+.webmcp-badge {
+  margin-left: auto; padding: 2px 8px; border-radius: 10px;
+  font-size: 8px; font-weight: 700; letter-spacing: 1px;
+  background: var(--surface2); color: var(--text-dim); border: 1px solid var(--border);
+}
+.webmcp-badge.active {
+  background: rgba(0,255,136,0.1); color: var(--green); border-color: rgba(0,255,136,0.3);
+  animation: ppulse 2s infinite;
+}
+
+.webmcp-body {
+  padding: 0 14px 14px;
+  display: flex; flex-direction: column; gap: 10px;
+  animation: slideDown 0.25s var(--ease);
+}
+
+.webmcp-status-row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 10px; padding: 4px 0;
+}
+.webmcp-label { color: var(--text-dim); }
+.webmcp-val { font-weight: 600; }
+.webmcp-val.ok { color: var(--green); }
+.webmcp-val.dim { color: var(--text-dim); }
+
+.webmcp-actions { display: flex; gap: 8px; }
+
+.webmcp-tools-list {
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+.webmcp-tool-head {
+  padding: 6px 10px; font-size: 8px; color: var(--text-dim);
+  background: var(--surface2); letter-spacing: 1px; text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+}
+.webmcp-tool-item {
+  padding: 5px 10px; display: flex; align-items: baseline; gap: 8px;
+  border-bottom: 1px solid rgba(42,42,90,0.3);
+  font-size: 10px;
+}
+.webmcp-tool-item:last-child { border-bottom: none; }
+.webmcp-tool-name {
+  color: var(--cyan); font-weight: 600; white-space: nowrap; min-width: 160px;
+}
+.webmcp-tool-desc { color: var(--text-dim); font-size: 9px; }
+
+.webmcp-stores {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.webmcp-store {
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+.webmcp-store-head {
+  padding: 5px 10px; font-size: 9px; color: var(--text-dim);
+  background: var(--surface2); display: flex; align-items: center; gap: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.webmcp-count {
+  background: var(--border); color: var(--text); padding: 1px 6px;
+  border-radius: 8px; font-size: 8px; font-weight: 700;
+}
+.webmcp-empty {
+  padding: 6px 10px; font-size: 9px; color: var(--text-dim); font-style: italic;
+}
+.webmcp-store-row {
+  padding: 4px 10px; display: flex; justify-content: space-between;
+  font-size: 9px; border-bottom: 1px solid rgba(42,42,90,0.2);
+}
+.webmcp-store-row:last-child { border-bottom: none; }
+.webmcp-addr { color: var(--cyan); font-family: var(--font-mono); }
+.webmcp-fp { color: var(--text-dim); font-family: var(--font-mono); }
+.webmcp-client-name { color: var(--text); }
+.webmcp-client-date { color: var(--text-dim); }
+.webmcp-session-status { font-weight: 600; }
+.webmcp-session-status.connected { color: var(--green); }
+.webmcp-session-status.initiating { color: var(--yellow); }
+.webmcp-session-status.timeout { color: var(--red); }
+
 /* ── Log ── */
 .log-wrap {
   background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);

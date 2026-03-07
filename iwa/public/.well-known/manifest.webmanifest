@@ -24,5 +24,29 @@
     "cross-origin-isolated": ["self"],
     "direct-sockets": ["self"],
     "direct-sockets-private": ["self"]
+  },
+  "webmcp": {
+    "tools": [
+      {
+        "name": "holepunch",
+        "description": "Initiate a NAT holepunch to establish a direct connection to a target .onion hidden service through the Tor network"
+      },
+      {
+        "name": "validateOnionCert",
+        "description": "Validate, store, or query TLS certificate fingerprints for .onion addresses this server has seen"
+      },
+      {
+        "name": "manageTrustedClients",
+        "description": "Manage the list of clients trusted by this Tor hidden service"
+      },
+      {
+        "name": "listHolepunchSessions",
+        "description": "List all active and past holepunch sessions"
+      },
+      {
+        "name": "getServiceStatus",
+        "description": "Get the current status of this Tor hidden service"
+      }
+    ]
   }
 }

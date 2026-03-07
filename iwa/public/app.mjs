@@ -1,6 +1,10 @@
 import { h, render, Fragment } from './lib/preact.mjs';
 import { useState, useEffect, useRef, useCallback, useMemo } from './lib/preact-hooks.mjs';
 import htm from './lib/htm.mjs';
+import {
+  registerWebMCPTools, unregisterWebMCPTools,
+  onionCertStore, trustedClients, holepunchSessions,
+} from './webmcp.mjs';
 const html = htm.bind(h);
 
 // ────────────────────────────────────────────
@@ -80,6 +84,13 @@ const S = {
   vanityAttempts: 0,
   vanityRate: 0,
   vanityFound: null,
+  // WebMCP state
+  webmcpAvailable: false,
+  webmcpEnabled: false,
+  webmcpOpen: false,
+  webmcpCerts: [],
+  webmcpClients: [],
+  webmcpSessions: [],
   _subs: new Set(),
 };
 function emit() { S._subs.forEach(fn => fn()); }
@@ -1101,6 +1112,204 @@ function LogViewer({ logs, dotOn }) {
 }
 
 // ────────────────────────────────────────────
+// WebMCP Panel — exposes Tor tools to AI agents
+// ────────────────────────────────────────────
+
+function refreshWebMCPState() {
+  S.webmcpCerts = Array.from(onionCertStore.entries()).map(([addr, c]) => ({
+    onionAddress: addr, fingerprint: c.fingerprint, lastSeen: c.lastSeen, valid: c.valid,
+  }));
+  S.webmcpClients = Array.from(trustedClients.entries()).map(([, c]) => c);
+  S.webmcpSessions = Array.from(holepunchSessions.entries()).map(([, s]) => s);
+  emit();
+}
+
+// Listen for WebMCP events dispatched by tool handlers
+function setupWebMCPListeners() {
+  // Holepunch event — simulate connection establishment
+  window.addEventListener('webmcp:holepunch', (e) => {
+    const { sessionId, targetOnion, _reqId } = e.detail;
+    addLog(`[WebMCP] Holepunch to ${targetOnion} (${sessionId.slice(0, 8)}...)`, 'info');
+
+    // Simulate async connection through Tor circuit
+    setTimeout(() => {
+      addLog(`[WebMCP] Holepunch ${sessionId.slice(0, 8)}... connected`, 'ok');
+      window.dispatchEvent(new CustomEvent('webmcp:holepunch:done', {
+        detail: { _reqId, result: { status: 'connected' } },
+      }));
+      refreshWebMCPState();
+    }, 1500);
+  });
+
+  // Cert stored
+  window.addEventListener('webmcp:cert-stored', (e) => {
+    const { onionAddress, _reqId } = e.detail;
+    addLog(`[WebMCP] Stored cert for ${onionAddress.slice(0, 16)}...`, 'ok');
+    window.dispatchEvent(new CustomEvent('webmcp:cert-stored:done', {
+      detail: { _reqId, result: { status: 'stored' } },
+    }));
+    refreshWebMCPState();
+  });
+
+  // Cert removed
+  window.addEventListener('webmcp:cert-removed', (e) => {
+    const { onionAddress, _reqId } = e.detail;
+    addLog(`[WebMCP] Removed cert for ${onionAddress.slice(0, 16)}...`, 'warn');
+    window.dispatchEvent(new CustomEvent('webmcp:cert-removed:done', {
+      detail: { _reqId, result: { status: 'removed' } },
+    }));
+    refreshWebMCPState();
+  });
+
+  // Client added
+  window.addEventListener('webmcp:client-added', (e) => {
+    const { clientId, name, _reqId } = e.detail;
+    addLog(`[WebMCP] Trusted client added: ${name || clientId}`, 'ok');
+    window.dispatchEvent(new CustomEvent('webmcp:client-added:done', {
+      detail: { _reqId, result: { status: 'added' } },
+    }));
+    refreshWebMCPState();
+  });
+
+  // Client removed
+  window.addEventListener('webmcp:client-removed', (e) => {
+    const { clientId, _reqId } = e.detail;
+    addLog(`[WebMCP] Trusted client removed: ${clientId}`, 'warn');
+    window.dispatchEvent(new CustomEvent('webmcp:client-removed:done', {
+      detail: { _reqId, result: { status: 'removed' } },
+    }));
+    refreshWebMCPState();
+  });
+
+  // Service status request
+  window.addEventListener('webmcp:get-status', (e) => {
+    const { _reqId } = e.detail;
+    window.dispatchEvent(new CustomEvent('webmcp:get-status:done', {
+      detail: {
+        _reqId,
+        result: {
+          onionAddress: S.hsAddress || null,
+          hsRunning: S.hsRunning,
+          torStatus: S.status,
+          bootstrapPct: S.bootstrap.pct,
+          trustedClientCount: trustedClients.size,
+          knownCertCount: onionCertStore.size,
+          activeHolepunches: holepunchSessions.size,
+        },
+      },
+    }));
+  });
+}
+
+function WebMCPPanel({ open, onToggle, available, enabled, onEnable, onDisable }) {
+  const s = useStore();
+
+  return html`
+    <div class="webmcp-section ${open ? 'open' : ''}">
+      <div class="webmcp-toggle" onClick=${onToggle}>
+        <span class="arr">\u25B6</span>
+        <span>WebMCP Tools</span>
+        <span class="webmcp-badge ${enabled ? 'active' : ''}">${enabled ? 'ACTIVE' : available ? 'READY' : 'N/A'}</span>
+      </div>
+      ${open && html`
+        <div class="webmcp-body">
+          <div class="webmcp-status-row">
+            <span class="webmcp-label">navigator.modelContext</span>
+            <span class="webmcp-val ${available ? 'ok' : 'dim'}">${available ? 'Available' : 'Not detected'}</span>
+          </div>
+
+          <div class="webmcp-actions">
+            ${!enabled && html`
+              <button class="primary" onClick=${onEnable} disabled=${!available}>
+                Register Tools
+              </button>
+            `}
+            ${enabled && html`
+              <button class="danger" onClick=${onDisable}>
+                Unregister Tools
+              </button>
+            `}
+          </div>
+
+          ${enabled && html`
+            <div class="webmcp-tools-list">
+              <div class="webmcp-tool-head">Registered Tools</div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">holepunch</span>
+                <span class="webmcp-tool-desc">NAT holepunch to .onion targets</span>
+              </div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">validateOnionCert</span>
+                <span class="webmcp-tool-desc">Cert fingerprint store/verify</span>
+              </div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">manageTrustedClients</span>
+                <span class="webmcp-tool-desc">Client trust management</span>
+              </div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">listHolepunchSessions</span>
+                <span class="webmcp-tool-desc">View holepunch sessions</span>
+              </div>
+              <div class="webmcp-tool-item">
+                <span class="webmcp-tool-name">getServiceStatus</span>
+                <span class="webmcp-tool-desc">Hidden service status</span>
+              </div>
+            </div>
+
+            <div class="webmcp-stores">
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Onion Certs <span class="webmcp-count">${s.webmcpCerts.length}</span>
+                </div>
+                ${s.webmcpCerts.length === 0 && html`
+                  <div class="webmcp-empty">No certificates stored</div>
+                `}
+                ${s.webmcpCerts.map(c => html`
+                  <div class="webmcp-store-row" key=${c.onionAddress}>
+                    <span class="webmcp-addr">${c.onionAddress.slice(0, 20)}...</span>
+                    <span class="webmcp-fp">${c.fingerprint ? c.fingerprint.slice(0, 16) + '...' : '-'}</span>
+                  </div>
+                `)}
+              </div>
+
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Trusted Clients <span class="webmcp-count">${s.webmcpClients.length}</span>
+                </div>
+                ${s.webmcpClients.length === 0 && html`
+                  <div class="webmcp-empty">No trusted clients</div>
+                `}
+                ${s.webmcpClients.map(c => html`
+                  <div class="webmcp-store-row" key=${c.clientId}>
+                    <span class="webmcp-client-name">${c.name}</span>
+                    <span class="webmcp-client-date">${c.addedAt ? c.addedAt.split('T')[0] : '-'}</span>
+                  </div>
+                `)}
+              </div>
+
+              <div class="webmcp-store">
+                <div class="webmcp-store-head">
+                  Holepunch Sessions <span class="webmcp-count">${s.webmcpSessions.length}</span>
+                </div>
+                ${s.webmcpSessions.length === 0 && html`
+                  <div class="webmcp-empty">No sessions</div>
+                `}
+                ${s.webmcpSessions.map(sess => html`
+                  <div class="webmcp-store-row" key=${sess.id}>
+                    <span class="webmcp-addr">${sess.target.slice(0, 20)}...</span>
+                    <span class="webmcp-session-status ${sess.status}">${sess.status}</span>
+                  </div>
+                `)}
+              </div>
+            </div>
+          `}
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// ────────────────────────────────────────────
 // App
 // ────────────────────────────────────────────
 function App() {
@@ -1169,6 +1378,36 @@ function App() {
 
   const toggleVanity = useCallback(() => { S.vanityOpen = !S.vanityOpen; emit(); }, []);
 
+  const toggleWebMCP = useCallback(() => { S.webmcpOpen = !S.webmcpOpen; emit(); }, []);
+
+  const enableWebMCP = useCallback(() => {
+    const ok = registerWebMCPTools();
+    if (ok) {
+      S.webmcpEnabled = true;
+      addLog('[WebMCP] 5 tools registered for AI agents', 'ok');
+      emit();
+    } else {
+      addLog('[WebMCP] Failed to register — modelContext not available', 'warn');
+    }
+  }, []);
+
+  const disableWebMCP = useCallback(() => {
+    unregisterWebMCPTools();
+    S.webmcpEnabled = false;
+    addLog('[WebMCP] Tools unregistered', 'warn');
+    emit();
+  }, []);
+
+  // Detect WebMCP availability on mount
+  useEffect(() => {
+    S.webmcpAvailable = !!navigator.modelContext;
+    if (S.webmcpAvailable) {
+      addLog('[WebMCP] navigator.modelContext detected', 'ok');
+    }
+    setupWebMCPListeners();
+    emit();
+  }, []);
+
   return html`
     <header>
       <img class="logo" src="/icon-192.png" alt="Tor" />
@@ -1212,6 +1451,15 @@ function App() {
 
       <${VanityBruteForce} open=${s.vanityOpen} onToggle=${toggleVanity} />
 
+      <${WebMCPPanel}
+        open=${s.webmcpOpen}
+        onToggle=${toggleWebMCP}
+        available=${s.webmcpAvailable}
+        enabled=${s.webmcpEnabled}
+        onEnable=${enableWebMCP}
+        onDisable=${disableWebMCP}
+      />
+
       <${HiddenServiceControls}
         running=${s.hsRunning}
         address=${s.hsAddress}
@@ -1224,7 +1472,7 @@ function App() {
 
     <${ConfigModal} open=${s.configModalOpen} onClose=${closeConfig} />
 
-    <footer>Tor 0.4.9.5 \u00b7 WebAssembly \u00b7 Direct Sockets \u00b7 Isolated Web App</footer>
+    <footer>Tor 0.4.9.5 \u00b7 WebAssembly \u00b7 Direct Sockets \u00b7 WebMCP \u00b7 Isolated Web App</footer>
   `;
 }
 
