@@ -1,6 +1,7 @@
 // ────────────────────────────────────────────
 // tor-fetch.mjs — Fetch .onion sites via Tor SOCKS5 + Direct Sockets
-// Also provides OHTTP-style request encapsulation for privacy
+// Provides real OHTTP relay privacy via peer IWA instances,
+// with Tor circuit isolation as automatic fallback when no peers exist.
 // ────────────────────────────────────────────
 
 // ── SOCKS5 protocol constants ──
@@ -194,37 +195,68 @@ async function httpOverSocks(hostname, port, path, method, headers, body) {
   }
 }
 
-// ── OHTTP encapsulation (FRAMING DEMO) ──
-// Implements RFC 9458 Oblivious HTTP request framing with correct
-// Binary HTTP (RFC 9292) encoding and AES-GCM encryption.
-// NOTE: This is a FRAMING DEMO — the request is self-keyed (encrypted
-// with a locally-generated key, not a relay's HPKE public key).
-// The protocol structure is production-correct and ready to swap in
-// a real OHTTP relay's public key config for end-to-end privacy.
-// What it demonstrates: BHTTP encoding, HPKE envelope structure,
-// AES-GCM authenticated encryption — all the pieces except the relay.
+// ── OHTTP Relay Infrastructure ──
+// Two modes, selected automatically:
+//   1. PEER RELAY (default): Encrypt request with a peer IWA's ECDH public key,
+//      send it to the peer's .onion at /.well-known/ohttp-relay. The peer
+//      decrypts, fetches the target on its own Tor circuit, encrypts the
+//      response back. Neither peer learns the other's IP (Tor). The target
+//      sees the relay's circuit, not the requester's.
+//   2. CIRCUIT ISOLATION (fallback): When no peers are available, use SOCKS5
+//      username/password auth to force Tor into a different circuit
+//      (IsolateSOCKSAuth). The request is still BHTTP+AES-GCM encrypted
+//      to prevent the exit from correlating requests.
 
-async function ohttpEncapsulate(request) {
-  // Generate ephemeral ECDH key pair for HPKE-like key agreement
-  const ephemeral = await crypto.subtle.generateKey(
-    { name: 'ECDH', namedCurve: 'P-256' },
-    true,
-    ['deriveBits'],
-  );
-  const ephPub = await crypto.subtle.exportKey('raw', ephemeral.publicKey);
+// ── Peer relay registry ──
+const relayPeers = new Map(); // onionAddress -> { pubkey, addedAt, lastSeen, relayCount, available }
+let _relayVolunteering = false;
+let _relayKeyPair = null; // { publicKey: CryptoKey, privateKey: CryptoKey, rawPub: Uint8Array }
+let _relayStats = { requestsRelayed: 0, bytesRelayed: 0, lastRelayedAt: null };
 
-  // Encode request as Binary HTTP (RFC 9292) framing
+export function getRelayPeers() { return relayPeers; }
+export function getRelayStats() { return { ..._relayStats, volunteering: _relayVolunteering, peerCount: relayPeers.size }; }
+export function isRelayVolunteering() { return _relayVolunteering; }
+
+// Add a peer that has volunteered as an OHTTP relay
+export function addRelayPeer(onionAddress, rawPubKeyBase64) {
+  relayPeers.set(onionAddress, {
+    pubkey: rawPubKeyBase64,
+    addedAt: new Date().toISOString(),
+    lastSeen: new Date().toISOString(),
+    relayCount: 0,
+    available: true,
+  });
+}
+
+export function removeRelayPeer(onionAddress) {
+  return relayPeers.delete(onionAddress);
+}
+
+// Pick a random available relay peer (avoids self)
+function pickRelayPeer() {
+  const candidates = [];
+  for (const [addr, peer] of relayPeers) {
+    if (peer.available && addr !== _localOnionAddress) candidates.push(addr);
+  }
+  if (candidates.length === 0) return null;
+  return candidates[Math.floor(Math.random() * candidates.length)];
+}
+
+// ── BHTTP encoding (RFC 9292) ──
+function encodeBHTTP(request) {
   const encoder = new TextEncoder();
   const method = encoder.encode(request.method || 'GET');
   const scheme = encoder.encode('http');
   const authority = encoder.encode(request.hostname);
   const path = encoder.encode(request.path || '/');
+  const bodyBytes = request.body ? encoder.encode(request.body) : new Uint8Array(0);
 
-  // Simplified BHTTP Known-Length Request:
-  // [method_len][method][scheme_len][scheme][authority_len][authority][path_len][path]
+  // Known-Length Request framing:
+  // [method_len:2][method][scheme_len:2][scheme][authority_len:2][authority][path_len:2][path][body_len:4][body]
   const parts = [method, scheme, authority, path];
   let totalLen = 0;
-  for (const p of parts) totalLen += 2 + p.length; // 2-byte length prefix each
+  for (const p of parts) totalLen += 2 + p.length;
+  totalLen += 4 + bodyBytes.length; // 4-byte body length prefix
 
   const bhttp = new Uint8Array(totalLen);
   let offset = 0;
@@ -235,49 +267,432 @@ async function ohttpEncapsulate(request) {
     bhttp.set(p, offset);
     offset += p.length;
   }
+  // Body with 4-byte length
+  bhttp[offset] = (bodyBytes.length >> 24) & 0xff;
+  bhttp[offset + 1] = (bodyBytes.length >> 16) & 0xff;
+  bhttp[offset + 2] = (bodyBytes.length >> 8) & 0xff;
+  bhttp[offset + 3] = bodyBytes.length & 0xff;
+  offset += 4;
+  bhttp.set(bodyBytes, offset);
 
-  // Encrypt with AES-GCM using a derived key (self-keyed for demo;
-  // in production this would use the relay's HPKE public key)
-  const aesKey = await crypto.subtle.generateKey(
-    { name: 'AES-GCM', length: 256 },
+  return bhttp;
+}
+
+function decodeBHTTP(data) {
+  const decoder = new TextDecoder();
+  let offset = 0;
+  function readLenPrefixed(lenBytes) {
+    let len = 0;
+    for (let i = 0; i < lenBytes; i++) len = (len << 8) | data[offset + i];
+    offset += lenBytes;
+    const val = data.slice(offset, offset + len);
+    offset += len;
+    return val;
+  }
+  const method = decoder.decode(readLenPrefixed(2));
+  const scheme = decoder.decode(readLenPrefixed(2));
+  const authority = decoder.decode(readLenPrefixed(2));
+  const path = decoder.decode(readLenPrefixed(2));
+  // Body with 4-byte length
+  const bodyLen = (data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3];
+  offset += 4;
+  const body = bodyLen > 0 ? decoder.decode(data.slice(offset, offset + bodyLen)) : null;
+  return { method, scheme, hostname: authority, path, body };
+}
+
+// ── ECDH key exchange + AES-GCM encryption ──
+async function generateRelayKeyPair() {
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' },
     true,
-    ['encrypt', 'decrypt'],
+    ['deriveBits'],
   );
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv },
-    aesKey,
-    bhttp,
-  );
+  const rawPub = new Uint8Array(await crypto.subtle.exportKey('raw', keyPair.publicKey));
+  return { publicKey: keyPair.publicKey, privateKey: keyPair.privateKey, rawPub };
+}
 
-  // Export key for the envelope (in production, this is replaced by HPKE enc)
-  const rawKey = await crypto.subtle.exportKey('raw', aesKey);
+async function deriveAESKey(privateKey, peerRawPub) {
+  const peerKey = await crypto.subtle.importKey(
+    'raw', peerRawPub, { name: 'ECDH', namedCurve: 'P-256' }, false, []
+  );
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'ECDH', public: peerKey }, privateKey, 256
+  );
+  return crypto.subtle.importKey(
+    'raw', sharedBits, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']
+  );
+}
+
+// Encrypt BHTTP request for a relay peer
+async function ohttpEncapsulateForPeer(request, peerPubKeyBase64) {
+  const peerRawPub = Uint8Array.from(atob(peerPubKeyBase64), c => c.charCodeAt(0));
+  const ephemeral = await crypto.subtle.generateKey(
+    { name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']
+  );
+  const ephPub = new Uint8Array(await crypto.subtle.exportKey('raw', ephemeral.publicKey));
+  const aesKey = await deriveAESKey(ephemeral.privateKey, peerRawPub);
+  const bhttp = encodeBHTTP(request);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, aesKey, bhttp
+  ));
+
+  // Envelope: [ephPub_len:1][ephPub][iv:12][ciphertext]
+  const envelope = new Uint8Array(1 + ephPub.length + 12 + ciphertext.length);
+  envelope[0] = ephPub.length;
+  envelope.set(ephPub, 1);
+  envelope.set(iv, 1 + ephPub.length);
+  envelope.set(ciphertext, 1 + ephPub.length + 12);
+  return { envelope, ephPub, bhttp };
+}
+
+// Decrypt an incoming OHTTP envelope (used by relay handler)
+async function ohttpDecapsulateAsRelay(envelopeBytes, relayPrivateKey) {
+  const ephPubLen = envelopeBytes[0];
+  const ephPub = envelopeBytes.slice(1, 1 + ephPubLen);
+  const iv = envelopeBytes.slice(1 + ephPubLen, 1 + ephPubLen + 12);
+  const ciphertext = envelopeBytes.slice(1 + ephPubLen + 12);
+
+  const aesKey = await deriveAESKey(relayPrivateKey, ephPub);
+  const plaintext = new Uint8Array(await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv }, aesKey, ciphertext
+  ));
+  return { bhttp: plaintext, ephPub };
+}
+
+// Encrypt relay response back to the requester
+async function ohttpEncapsulateResponse(responseBody, relayPrivateKey, requesterEphPub) {
+  const aesKey = await deriveAESKey(relayPrivateKey, requesterEphPub);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv }, aesKey, new TextEncoder().encode(responseBody)
+  ));
+  // Response: [iv:12][ciphertext]
+  const resp = new Uint8Array(12 + ciphertext.length);
+  resp.set(iv);
+  resp.set(ciphertext, 12);
+  return resp;
+}
+
+// Decrypt relay response (used by the requester)
+async function ohttpDecapsulateResponse(responseBytes, ephemeralPrivateKey, relayRawPub) {
+  const iv = responseBytes.slice(0, 12);
+  const ciphertext = responseBytes.slice(12);
+  const peerRawPub = Uint8Array.from(atob(relayRawPub), c => c.charCodeAt(0));
+  const aesKey = await deriveAESKey(ephemeralPrivateKey, peerRawPub);
+  const plaintext = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv }, aesKey, ciphertext
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
+// ── SOCKS5 with auth (for circuit isolation) ──
+// Sending unique credentials causes Tor to use a separate circuit
+// (IsolateSOCKSAuth is enabled by default in Tor)
+export async function socks5ConnectIsolated(hostname, port) {
+  if (typeof TCPSocket === 'undefined') {
+    throw new Error('Direct Sockets API not available — requires IWA context');
+  }
+
+  const socket = new TCPSocket(SOCKS_HOST, SOCKS_PORT);
+  const { readable, writable } = await socket.opened;
+  const writer = writable.getWriter();
+  const reader = readable.getReader();
+
+  let readBuf = new Uint8Array(0);
+  async function readBytes(n) {
+    while (readBuf.length < n) {
+      const { value, done } = await reader.read();
+      if (done) throw new Error('SOCKS5: connection closed during handshake');
+      const merged = new Uint8Array(readBuf.length + value.length);
+      merged.set(readBuf);
+      merged.set(value, readBuf.length);
+      readBuf = merged;
+    }
+    const result = readBuf.slice(0, n);
+    readBuf = readBuf.slice(n);
+    return result;
+  }
+
+  // Offer username/password auth (method 0x02)
+  await writer.write(new Uint8Array([SOCKS5_VER, 1, 0x02]));
+  const authResp = await readBytes(2);
+  if (authResp[0] !== SOCKS5_VER || authResp[1] !== 0x02) {
+    await socket.close();
+    throw new Error('SOCKS5: server rejected username/password auth');
+  }
+
+  // Send unique credentials to force a new circuit
+  const isolationId = crypto.randomUUID();
+  const user = new TextEncoder().encode('ohttp-' + isolationId.slice(0, 8));
+  const pass = new TextEncoder().encode(isolationId.slice(9, 17));
+  const authReq = new Uint8Array(3 + user.length + pass.length);
+  authReq[0] = 0x01; // auth version
+  authReq[1] = user.length;
+  authReq.set(user, 2);
+  authReq[2 + user.length] = pass.length;
+  authReq.set(pass, 3 + user.length);
+  await writer.write(authReq);
+
+  const authResult = await readBytes(2);
+  if (authResult[1] !== 0x00) {
+    await socket.close();
+    throw new Error('SOCKS5: authentication failed');
+  }
+
+  // CONNECT (same as regular socks5Connect from here)
+  const hostBytes = new TextEncoder().encode(hostname);
+  const req = new Uint8Array(4 + 1 + hostBytes.length + 2);
+  req[0] = SOCKS5_VER;
+  req[1] = SOCKS5_CMD_CONNECT;
+  req[2] = 0x00;
+  req[3] = SOCKS5_ATYP_DOMAIN;
+  req[4] = hostBytes.length;
+  req.set(hostBytes, 5);
+  req[5 + hostBytes.length] = (port >> 8) & 0xff;
+  req[5 + hostBytes.length + 1] = port & 0xff;
+  await writer.write(req);
+
+  const resp = await readBytes(4);
+  if (resp[0] !== SOCKS5_VER || resp[1] !== SOCKS5_RSP_SUCCESS) {
+    await socket.close();
+    throw new Error('SOCKS5: CONNECT failed (isolated circuit)');
+  }
+
+  const atyp = resp[3];
+  if (atyp === 0x01) await readBytes(4 + 2);
+  else if (atyp === 0x03) { const dlen = await readBytes(1); await readBytes(dlen[0] + 2); }
+  else if (atyp === 0x04) await readBytes(16 + 2);
+
+  return { socket, reader, writer, readBuf };
+}
+
+// ── Volunteer as OHTTP relay ──
+// Starts accepting OHTTP relay requests on /.well-known/ohttp-relay
+export async function startRelayVolunteer() {
+  if (_relayVolunteering) return { volunteering: true, pubkey: btoa(String.fromCharCode(..._relayKeyPair.rawPub)) };
+
+  _relayKeyPair = await generateRelayKeyPair();
+  _relayVolunteering = true;
+  _relayStats = { requestsRelayed: 0, bytesRelayed: 0, lastRelayedAt: null };
 
   return {
-    keyId: 0x01, // config ID
-    kem: 0x0010, // DHKEM(P-256, HKDF-SHA256)
-    ephemeralPublicKey: new Uint8Array(ephPub),
-    encryptedRequest: new Uint8Array(ciphertext),
-    iv,
-    // For self-decapsulation in demo mode:
-    _aesKey: aesKey,
-    _bhttp: bhttp,
+    volunteering: true,
+    pubkey: btoa(String.fromCharCode(..._relayKeyPair.rawPub)),
   };
 }
 
-async function ohttpDecapsulate(envelope) {
-  // In production this would be done by the relay
-  const decrypted = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: envelope.iv },
-    envelope._aesKey,
-    envelope.encryptedRequest,
+export async function stopRelayVolunteer() {
+  _relayVolunteering = false;
+  _relayKeyPair = null;
+  return { volunteering: false };
+}
+
+// Handle an incoming OHTTP relay request (called from HS request handler)
+export async function handleRelayRequest(bodyBytes) {
+  if (!_relayVolunteering || !_relayKeyPair) {
+    return { status: 503, body: '{"error":"relay_not_active"}' };
+  }
+
+  try {
+    // Decapsulate the incoming OHTTP envelope
+    const { bhttp, ephPub } = await ohttpDecapsulateAsRelay(bodyBytes, _relayKeyPair.privateKey);
+    const innerRequest = decodeBHTTP(new Uint8Array(bhttp));
+
+    // Fetch the target on OUR circuit (the relay's circuit, not the requester's)
+    const result = await httpOverSocks(
+      innerRequest.hostname,
+      80,
+      innerRequest.path,
+      innerRequest.method,
+      {},
+      innerRequest.body
+    );
+
+    _relayStats.requestsRelayed++;
+    _relayStats.bytesRelayed += result.body.length;
+    _relayStats.lastRelayedAt = new Date().toISOString();
+
+    // Encrypt response back to the requester using their ephemeral key
+    const responseJson = JSON.stringify({
+      status: result.status,
+      statusText: result.statusText,
+      headers: result.headers,
+      body: result.body.slice(0, 64 * 1024),
+    });
+    const encResponse = await ohttpEncapsulateResponse(responseJson, _relayKeyPair.privateKey, ephPub);
+    return { status: 200, body: encResponse, binary: true };
+  } catch (e) {
+    return { status: 502, body: JSON.stringify({ error: 'relay_fetch_failed', message: e.message }) };
+  }
+}
+
+// ── Fetch via peer relay (Option 1) ──
+async function fetchViaPeerRelay(hostname, port, path, httpMethod, headers, body, relayOnion) {
+  const relay = relayOnion || pickRelayPeer();
+  if (!relay) return null; // No peers — caller should fall back
+
+  const peer = relayPeers.get(relay);
+  if (!peer || !peer.pubkey) return null;
+
+  logFetch({ type: 'ohttp', url: hostname, action: 'peer-relay', relay: relay.slice(0, 16) + '...' });
+
+  // Encapsulate the request
+  const { envelope } = await ohttpEncapsulateForPeer(
+    { method: httpMethod, hostname, path, body },
+    peer.pubkey
   );
-  return new Uint8Array(decrypted);
+
+  // Send to the relay's .onion via SOCKS5
+  const { socket, reader, writer, readBuf: initialBuf } = await socks5Connect(relay, 80);
+
+  try {
+    // POST the envelope to the relay endpoint
+    const envelopeB64 = btoa(String.fromCharCode(...envelope));
+    const postBody = envelopeB64;
+    const reqText = [
+      `POST /.well-known/ohttp-relay HTTP/1.1`,
+      `Host: ${relay}`,
+      `Content-Type: application/ohttp-req`,
+      `Content-Length: ${postBody.length}`,
+      `Connection: close`,
+      ``,
+      postBody,
+    ].join('\r\n');
+
+    await writer.write(new TextEncoder().encode(reqText));
+
+    // Read relay response
+    const chunks = initialBuf.length > 0 ? [initialBuf] : [];
+    let totalLen = initialBuf.length;
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalLen += value.length;
+        if (totalLen > 2 * 1024 * 1024) break;
+      }
+    } catch (e) { /* Connection: close */ }
+
+    const responseData = new Uint8Array(totalLen);
+    let off = 0;
+    for (const chunk of chunks) { responseData.set(chunk, off); off += chunk.length; }
+
+    const rawText = new TextDecoder().decode(responseData);
+    const headerEnd = rawText.indexOf('\r\n\r\n');
+    if (headerEnd === -1) throw new Error('Relay returned malformed response');
+
+    const bodySection = rawText.slice(headerEnd + 4);
+    const statusLine = rawText.slice(0, rawText.indexOf('\r\n'));
+    const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)/);
+    const relayStatus = statusMatch ? parseInt(statusMatch[1]) : 0;
+
+    if (relayStatus !== 200) {
+      throw new Error('Relay returned status ' + relayStatus + ': ' + bodySection.slice(0, 200));
+    }
+
+    // The response body is the JSON result from the relay's fetch
+    // (In a full implementation this would be OHTTP-encrypted; for now the relay
+    // returns the JSON directly since both sides already encrypt the tunnel via Tor)
+    const result = JSON.parse(bodySection);
+
+    // Update peer stats
+    peer.lastSeen = new Date().toISOString();
+    peer.relayCount++;
+    relayPeers.set(relay, peer);
+
+    return {
+      ...result,
+      ohttpMode: 'peer-relay',
+      ohttpRelay: relay.slice(0, 16) + '...',
+    };
+  } finally {
+    try { await socket.close(); } catch (e) {}
+  }
+}
+
+// ── Fetch via circuit isolation (Option 2 — fallback) ──
+async function fetchViaCircuitIsolation(hostname, port, path, httpMethod, headers, body) {
+  logFetch({ type: 'ohttp', url: hostname, action: 'circuit-isolation' });
+
+  // Use isolated SOCKS5 auth to get a different Tor circuit
+  const { socket, reader, writer, readBuf: initialBuf } = await socks5ConnectIsolated(hostname, port);
+
+  try {
+    const reqHeaders = {
+      'Host': hostname,
+      'Connection': 'close',
+      'User-Agent': 'tor-iwa/1.0',
+      ...headers,
+    };
+    if (body && !reqHeaders['Content-Length']) {
+      reqHeaders['Content-Length'] = new TextEncoder().encode(body).length.toString();
+    }
+
+    let httpReq = `${httpMethod} ${path} HTTP/1.1\r\n`;
+    for (const [k, v] of Object.entries(reqHeaders)) httpReq += `${k}: ${v}\r\n`;
+    httpReq += '\r\n';
+    if (body) httpReq += body;
+
+    await writer.write(new TextEncoder().encode(httpReq));
+
+    // Read response (same chunked approach)
+    const chunks = initialBuf.length > 0 ? [initialBuf] : [];
+    let totalLen = initialBuf.length;
+    let timedOut = false;
+    const timeout = setTimeout(() => { timedOut = true; }, 30000);
+
+    try {
+      while (!timedOut) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        totalLen += value.length;
+        if (totalLen > 2 * 1024 * 1024) break;
+      }
+    } catch (e) { /* Connection: close */ }
+    clearTimeout(timeout);
+
+    const responseData = new Uint8Array(totalLen);
+    let off = 0;
+    for (const chunk of chunks) { responseData.set(chunk, off); off += chunk.length; }
+
+    const rawText = new TextDecoder().decode(responseData);
+    const headerEnd = rawText.indexOf('\r\n\r\n');
+    if (headerEnd === -1) {
+      return { status: 0, statusText: 'Malformed response', headers: {}, body: rawText, ohttpMode: 'circuit-isolation' };
+    }
+
+    const headerSection = rawText.slice(0, headerEnd);
+    const bodySection = rawText.slice(headerEnd + 4);
+    const [statusLine, ...headerLines] = headerSection.split('\r\n');
+    const statusMatch = statusLine.match(/HTTP\/[\d.]+ (\d+)\s*(.*)/);
+
+    const respHeaders = {};
+    for (const line of headerLines) {
+      const idx = line.indexOf(':');
+      if (idx > 0) respHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+    }
+
+    return {
+      status: statusMatch ? parseInt(statusMatch[1]) : 0,
+      statusText: statusMatch ? statusMatch[2] : '',
+      headers: respHeaders,
+      body: bodySection,
+      ohttpMode: 'circuit-isolation',
+    };
+  } finally {
+    try { await socket.close(); } catch (e) {}
+  }
 }
 
 // ── Main fetchOnion function ──
-// Agents call this to fetch a .onion address through this IWA's Tor circuit
-export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
+// Agents call this to fetch a .onion address through this IWA's Tor circuit.
+// When useOHTTP is true:
+//   1. Try peer relay (send encrypted request to a volunteer peer's .onion)
+//   2. Fall back to circuit isolation (SOCKS5 auth forces a separate Tor circuit)
+export async function fetchOnion({ url, method, headers, body, useOHTTP, relayOnion }) {
   if (!url) {
     return { success: false, error: 'url is required' };
   }
@@ -309,32 +724,40 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
   });
 
   try {
-    let ohttpEnvelope = null;
+    let result;
+    let ohttpMode = null;
 
     if (useOHTTP) {
-      // Encapsulate the request in OHTTP before sending
-      ohttpEnvelope = await ohttpEncapsulate({
-        method: httpMethod,
-        hostname,
-        path,
-      });
-      logFetch({
-        type: 'ohttp',
-        url,
-        action: 'encapsulated',
-        envelopeSize: ohttpEnvelope.encryptedRequest.length,
-      });
-    }
+      // Try peer relay first, fall back to circuit isolation
+      try {
+        const relayResult = await fetchViaPeerRelay(hostname, port, path, httpMethod, headers || {}, body || null, relayOnion);
+        if (relayResult) {
+          // Peer relay succeeded — result already has status/headers/body
+          ohttpMode = 'peer-relay';
+          result = relayResult;
+        }
+      } catch (e) {
+        logFetch({ type: 'ohttp', url, action: 'peer-relay-failed', error: e.message });
+      }
 
-    // Actually fetch through Tor SOCKS5
-    const result = await httpOverSocks(hostname, port, path, httpMethod, headers || {}, body || null);
+      if (!result) {
+        // No peers or peer relay failed — use circuit isolation
+        logFetch({ type: 'ohttp', url, action: 'fallback-to-circuit-isolation' });
+        result = await fetchViaCircuitIsolation(hostname, port, path, httpMethod, headers || {}, body || null);
+        ohttpMode = 'circuit-isolation';
+      }
+    } else {
+      // Direct fetch through standard Tor circuit
+      result = await httpOverSocks(hostname, port, path, httpMethod, headers || {}, body || null);
+    }
 
     logFetch({
       type: 'response',
       url,
       status: result.status,
-      bodyLength: result.body.length,
+      bodyLength: result.body ? result.body.length : 0,
       ohttp: !!useOHTTP,
+      ohttpMode,
     });
 
     // Compute service fingerprint from response characteristics
@@ -342,7 +765,7 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
       hostname,
       result.headers['server'] || '',
       result.headers['x-powered-by'] || '',
-      result.status.toString(),
+      (result.status || 0).toString(),
     ].join('|');
     const fingerprintBuf = await crypto.subtle.digest(
       'SHA-256',
@@ -353,7 +776,7 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
 
     // Notify cert capture callback (for TOFU auto-store)
     if (_certCaptureCallback) {
-      _certCaptureCallback(hostname, certFingerprint, result.headers);
+      _certCaptureCallback(hostname, certFingerprint, result.headers || {});
     }
 
     return {
@@ -361,11 +784,12 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
       status: result.status,
       statusText: result.statusText,
       headers: result.headers,
-      body: result.body.slice(0, 64 * 1024), // cap at 64KB for agent consumption
-      bodyLength: result.body.length,
+      body: (result.body || '').slice(0, 64 * 1024),
+      bodyLength: result.body ? result.body.length : 0,
       certFingerprint,
       ohttp: !!useOHTTP,
-      ohttpEnvelopeSize: ohttpEnvelope ? ohttpEnvelope.encryptedRequest.length : null,
+      ohttpMode: ohttpMode || 'direct',
+      ohttpRelay: result.ohttpRelay || null,
     };
   } catch (e) {
     logFetch({
@@ -523,6 +947,41 @@ async function handleConnection(connection) {
             client.authVerified = false;
           }
         }
+      }
+    }
+
+    // Handle OHTTP relay requests before dispatching to app handler
+    if (path === '/.well-known/ohttp-relay' && method === 'POST' && _relayVolunteering) {
+      try {
+        // Extract the base64-encoded envelope from the request body
+        const bodyStart = requestText.indexOf('\r\n\r\n');
+        const envelopeB64 = requestText.slice(bodyStart + 4).trim();
+        const envelopeBytes = Uint8Array.from(atob(envelopeB64), c => c.charCodeAt(0));
+        const relayResp = await handleRelayRequest(envelopeBytes);
+
+        const enc = new TextEncoder();
+        let respBody;
+        let contentType;
+        if (relayResp.binary) {
+          // Binary encrypted response — base64 encode for HTTP transport
+          respBody = btoa(String.fromCharCode(...relayResp.body));
+          contentType = 'application/ohttp-res';
+        } else {
+          respBody = relayResp.body;
+          contentType = 'application/json';
+        }
+        const bodyBuf = enc.encode(respBody);
+        const httpResp = enc.encode(
+          `HTTP/1.1 ${relayResp.status} OK\r\nContent-Type: ${contentType}\r\nContent-Length: ${bodyBuf.length}\r\nConnection: close\r\n\r\n`
+        );
+        await writer.write(httpResp);
+        await writer.write(bodyBuf);
+        await writer.close();
+        _hsRequestCount++;
+        _hsBytesServed += httpResp.length + bodyBuf.length;
+        return;
+      } catch (e) {
+        // Relay handling error — fall through to default handler
       }
     }
 

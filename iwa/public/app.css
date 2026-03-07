@@ -405,6 +405,36 @@ main { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; 
   font-size: 9px; color: var(--green);
 }
 
+/* ── OHTTP Relay Card ── */
+.relay-card {
+  background: linear-gradient(180deg, rgba(0,180,255,0.04) 0%, var(--surface) 40%);
+  border-color: rgba(0,180,255,0.15);
+  border-top: 2px solid rgba(0,180,255,0.15);
+  transition: border-color 0.5s var(--ease), box-shadow 0.5s var(--ease);
+}
+.relay-card.active {
+  border-top-color: var(--cyan);
+  box-shadow: 0 -1px 20px rgba(0,204,255,0.08), inset 0 1px 0 rgba(0,204,255,0.05);
+}
+.relay-card .card-head {
+  border-bottom-color: rgba(0,180,255,0.12);
+  color: rgba(0,204,255,0.7);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.relay-mode-row {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 4px 0;
+}
+.relay-mode-label {
+  font-size: 9px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 1px;
+}
+.relay-mode-val {
+  font-size: 10px; font-family: var(--mono);
+}
+.relay-mode-val.ok { color: var(--cyan); }
+.relay-mode-val.dim { color: var(--text-dim); }
+.footer-indicator.relay.on .fdot { background: var(--cyan); box-shadow: 0 0 6px rgba(0,204,255,0.5); }
+
 /* ── WebMCP Card ── */
 .webmcp-card {
   background: linear-gradient(180deg, rgba(123,77,255,0.04) 0%, var(--surface) 40%);

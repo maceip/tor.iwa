@@ -12,6 +12,13 @@ import {
   setTrustedClientsRef,
   setCertCaptureCallback,
   getLocalOnionAddress,
+  startRelayVolunteer,
+  stopRelayVolunteer,
+  addRelayPeer,
+  removeRelayPeer,
+  getRelayPeers,
+  getRelayStats,
+  isRelayVolunteering,
 } from './tor-fetch.mjs';
 
 // ── Internal state stores ──
@@ -644,11 +651,110 @@ async function getServiceStatus() {
       holepunchTargets: activeSessions,
       totalSessions: holepunchSessions.size,
     },
+    ohttpRelay: {
+      volunteering: isRelayVolunteering(),
+      peerCount: getRelayPeers().size,
+      ...getRelayStats(),
+    },
     fetchLog: {
       totalEntries: fetchLog.length,
       recentErrors: fetchLog.filter(e => e.type === 'error').slice(-5),
     },
   };
+}
+
+// ── OHTTP Relay Management tool ──
+// Lets agents volunteer this instance as a relay, add/remove peers, check status
+async function manageOHTTPRelay({ action, peerOnion, peerPubkey }) {
+  const act = action || 'status';
+
+  if (act === 'volunteer') {
+    const result = await startRelayVolunteer();
+    const localAddr = getLocalOnionAddress();
+    window.dispatchEvent(new CustomEvent('webmcp:relay-started', {
+      detail: { pubkey: result.pubkey, onion: localAddr },
+    }));
+    return {
+      success: true,
+      action: 'volunteer',
+      volunteering: true,
+      pubkey: result.pubkey,
+      localOnion: localAddr,
+      note: 'This instance is now accepting OHTTP relay requests at /.well-known/ohttp-relay. Share your .onion address and pubkey with peers.',
+    };
+  }
+
+  if (act === 'stop') {
+    await stopRelayVolunteer();
+    window.dispatchEvent(new CustomEvent('webmcp:relay-stopped', { detail: {} }));
+    return { success: true, action: 'stop', volunteering: false };
+  }
+
+  if (act === 'addPeer') {
+    if (!peerOnion || !peerOnion.endsWith('.onion')) {
+      return { success: false, error: 'peerOnion must be a valid .onion address' };
+    }
+    if (!peerPubkey) {
+      return { success: false, error: 'peerPubkey (base64 ECDH public key) is required' };
+    }
+    addRelayPeer(peerOnion, peerPubkey);
+    window.dispatchEvent(new CustomEvent('webmcp:relay-peer-added', {
+      detail: { peerOnion, peerPubkey: peerPubkey.slice(0, 16) + '...' },
+    }));
+    return {
+      success: true,
+      action: 'addPeer',
+      peerOnion,
+      totalPeers: getRelayPeers().size,
+      note: 'Peer added. fetchOnion with useOHTTP=true will now route through available peers.',
+    };
+  }
+
+  if (act === 'removePeer') {
+    if (!peerOnion) return { success: false, error: 'peerOnion is required' };
+    const removed = removeRelayPeer(peerOnion);
+    window.dispatchEvent(new CustomEvent('webmcp:relay-peer-removed', {
+      detail: { peerOnion },
+    }));
+    return { success: removed, action: 'removePeer', peerOnion, totalPeers: getRelayPeers().size };
+  }
+
+  if (act === 'listPeers') {
+    const peers = [];
+    for (const [addr, peer] of getRelayPeers()) {
+      peers.push({
+        onion: addr,
+        pubkey: peer.pubkey ? peer.pubkey.slice(0, 16) + '...' : null,
+        addedAt: peer.addedAt,
+        lastSeen: peer.lastSeen,
+        relayCount: peer.relayCount,
+        available: peer.available,
+      });
+    }
+    return { action: 'listPeers', count: peers.length, peers };
+  }
+
+  if (act === 'status') {
+    const stats = getRelayStats();
+    const peers = [];
+    for (const [addr, peer] of getRelayPeers()) {
+      peers.push({ onion: addr.slice(0, 16) + '...', relayCount: peer.relayCount });
+    }
+    return {
+      action: 'status',
+      volunteering: stats.volunteering,
+      peerCount: stats.peerCount,
+      requestsRelayed: stats.requestsRelayed,
+      bytesRelayed: stats.bytesRelayed,
+      lastRelayedAt: stats.lastRelayedAt,
+      peers,
+      note: stats.peerCount === 0
+        ? 'No peers available. fetchOnion with useOHTTP=true will use circuit isolation (SOCKS5 auth-based circuit separation) as fallback.'
+        : 'Peer relay active. fetchOnion with useOHTTP=true will route through a random available peer.',
+    };
+  }
+
+  return { success: false, error: 'Unknown action: ' + act + '. Use: volunteer, stop, addPeer, removePeer, listPeers, status' };
 }
 
 // ── Enhanced fetchOnion wrapper ──
@@ -830,7 +936,7 @@ export function registerWebMCPTools() {
   navigator.modelContext.registerTool(
     'fetchOnion',
     {
-      description: 'Fetch a .onion URL through this IWA\'s Tor circuit using Direct Sockets SOCKS5. Returns the HTTP response plus TOFU certificate verification status. Fingerprints are auto-captured on first contact and verified on subsequent fetches. Optional useOHTTP flag enables RFC 9458 OHTTP framing demo (correct BHTTP encoding + AES-GCM, self-keyed — ready for a real relay).',
+      description: 'Fetch a .onion URL through Tor. When useOHTTP=true, routes through a peer OHTTP relay (another tor.iwa instance) for application-layer unlinkability. If no peers are available, automatically falls back to Tor circuit isolation (unique SOCKS5 credentials force a separate circuit). Returns HTTP response + TOFU cert verification + OHTTP mode used.',
       parameters: {
         type: 'object',
         properties: {
@@ -853,7 +959,11 @@ export function registerWebMCPTools() {
           },
           useOHTTP: {
             type: 'boolean',
-            description: 'Wrap in Oblivious HTTP (OHTTP) for additional privacy',
+            description: 'Enable OHTTP privacy: peer relay (default) or circuit isolation (fallback)',
+          },
+          relayOnion: {
+            type: 'string',
+            description: 'Specific peer .onion to use as OHTTP relay (optional, random peer chosen if omitted)',
           },
         },
         required: ['url'],
@@ -862,7 +972,35 @@ export function registerWebMCPTools() {
     fetchOnionWithCertCheck,
   );
 
-  console.log('[WebMCP] Registered 6 production Tor hidden service tools');
+  // Tool 7: manageOHTTPRelay — OHTTP relay volunteering and peer management
+  navigator.modelContext.registerTool(
+    'manageOHTTPRelay',
+    {
+      description: 'Manage OHTTP relay infrastructure. "volunteer" makes this instance accept relay requests from peers. "addPeer" registers another tor.iwa instance as an available relay. "status" shows relay stats and peer list. When peers are available, fetchOnion with useOHTTP=true routes through them for real application-layer privacy.',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['volunteer', 'stop', 'addPeer', 'removePeer', 'listPeers', 'status'],
+            description: 'Action to perform (default: "status")',
+          },
+          peerOnion: {
+            type: 'string',
+            description: 'Peer .onion address (for addPeer/removePeer)',
+          },
+          peerPubkey: {
+            type: 'string',
+            description: 'Peer ECDH public key in base64 (for addPeer)',
+          },
+        },
+        required: [],
+      },
+    },
+    manageOHTTPRelay,
+  );
+
+  console.log('[WebMCP] Registered 7 Tor hidden service tools (incl. OHTTP relay)');
   return true;
 }
 
@@ -876,9 +1014,11 @@ export function unregisterWebMCPTools() {
   navigator.modelContext.unregisterTool('listHolepunchSessions');
   navigator.modelContext.unregisterTool('getServiceStatus');
   navigator.modelContext.unregisterTool('fetchOnion');
+  navigator.modelContext.unregisterTool('manageOHTTPRelay');
 
   console.log('[WebMCP] Unregistered Tor hidden service tools');
 }
 
 // ── Expose stores for UI consumption ──
 export { onionCertStore, trustedClients, holepunchSessions, fetchLog, getServerStatus };
+export { getRelayPeers, getRelayStats, isRelayVolunteering } from './tor-fetch.mjs';

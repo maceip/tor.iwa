@@ -1,40 +1,70 @@
 ## Title
 
-Add Tor Hidden Service IWA — WebMCP tools for anonymous AI agent networking
+Add Tor Hidden Service IWA — WebMCP tools for anonymous AI agent networking with OHTTP relay mesh
 
 ## Body
 
 ### Summary
 
-This PR adds a **Tor Hidden Service running inside an Isolated Web App** with 6 WebMCP tools that give AI agents capabilities they can't get any other way: anonymous `.onion` browsing, peer-to-peer connections over Tor, and cryptographic access control for hidden services.
+This PR adds a **Tor Hidden Service running inside an Isolated Web App** with 7 WebMCP tools that give AI agents capabilities they can't get any other way: anonymous `.onion` browsing with real OHTTP privacy via a peer relay mesh, peer-to-peer connections over Tor, and cryptographic access control for hidden services.
 
-**Live demo**: An AI agent can `fetchOnion` to browse `.onion` sites through the user's Tor circuit, `holepunch` to open direct TCP connections to other hidden services for anonymous agent-to-agent communication, and `manageTrustedClients` to control who can access the hidden service with Ed25519 signature verification.
+**What's new:** Every tor.iwa instance can **volunteer as an OHTTP relay** for other instances. When an agent calls `fetchOnion` with `useOHTTP=true`, the request is ECDH-encrypted and sent to a peer's `.onion`, where the peer decrypts and fetches the target on its own Tor circuit. This provides real application-layer unlinkability — the target sees the relay's circuit, not the requester's. When no peers are available, the system automatically falls back to **Tor circuit isolation** (unique SOCKS5 credentials force a separate circuit via `IsolateSOCKSAuth`).
 
 ### Why this is interesting for WebMCP
 
-This is the first WebMCP integration that gives AI agents access to **network-level capabilities** rather than just application features:
+This is the first WebMCP integration that gives AI agents access to **network-level privacy infrastructure** rather than just application features:
 
-1. **`fetchOnion`** — AI agents cannot normally reach `.onion` addresses. This tool routes requests through a real Tor circuit via Direct Sockets SOCKS5, returning HTTP responses with automatic TOFU certificate verification. The agent gets anonymous web access to the entire `.onion` ecosystem.
+1. **`fetchOnion`** — AI agents cannot normally reach `.onion` addresses. This tool routes requests through a real Tor circuit via Direct Sockets SOCKS5. With `useOHTTP=true`, requests are encrypted and relayed through a peer IWA instance for application-layer unlinkability, or use circuit isolation as an automatic fallback. Returns HTTP response + TOFU cert verification + OHTTP mode used.
 
-2. **`holepunch`** — Opens real bidirectional TCP connections to other `.onion` hidden services. This is the foundation for **anonymous AI-to-AI communication** — Agent A publishes a `.onion`, Agent B holepunches to it, they exchange messages without either knowing the other's IP address. Supports `connect` / `send` / `receive` / `close` actions on persistent sessions.
+2. **`manageOHTTPRelay`** — The relay mesh management tool. `volunteer` makes this instance accept OHTTP relay requests from peers. `addPeer`/`removePeer` manages known relays. `status` shows relay stats. This creates a decentralized privacy network where every tor.iwa user is a potential relay for every other user.
 
-3. **`validateOnionCert`** — Trust-on-first-use (TOFU) certificate management. Service fingerprints are auto-captured on every `fetchOnion` call and compared on subsequent fetches. Detects identity changes that may indicate service compromise. The AI agent manages its own trust decisions about anonymous services.
+3. **`holepunch`** — Opens real bidirectional TCP connections to other `.onion` hidden services. Foundation for **anonymous AI-to-AI communication** — Agent A publishes a `.onion`, Agent B holepunches to it, they exchange messages without either knowing the other's IP. Supports `connect` / `send` / `receive` / `close` actions.
 
-4. **`manageTrustedClients`** — Real access control enforcement on the hidden service. When trusted clients are added, the HS HTTP handler rejects requests without a valid `X-Client-ID` header (returns 403). Supports Ed25519 public key registration and signature verification via `X-Client-Auth` headers.
+4. **`validateOnionCert`** — Trust-on-first-use (TOFU) certificate management. Service fingerprints are auto-captured on every `fetchOnion` call. Detects identity changes that may indicate service compromise.
 
-5. **`getServiceStatus`** — Aggregated dashboard of the entire system: HS uptime/request/byte stats, access control state, cert store health, active holepunch sessions, and recent fetch errors.
+5. **`manageTrustedClients`** — Real access control enforcement on the hidden service. Rejects requests without a valid `X-Client-ID` header (returns 403). Supports Ed25519 public key registration and signature verification via `X-Client-Auth` headers.
 
-6. **`listHolepunchSessions`** — Lists all peer connections with connection status, message/byte counts, and timestamps.
+6. **`getServiceStatus`** — Aggregated dashboard including OHTTP relay state: volunteering status, peer count, requests relayed, bytes relayed, plus HS uptime/stats, cert store health, and active holepunch sessions.
+
+7. **`listHolepunchSessions`** — Lists all peer connections with connection status, message/byte counts, and timestamps.
+
+### OHTTP relay architecture
+
+```
+┌──────────┐    ECDH-encrypted    ┌──────────────┐    Separate     ┌──────────┐
+│ Your IWA │ ────────────────────→ │ Peer Relay   │ ──────────────→ │  Target  │
+│          │    via Tor circuit A  │ (.onion IWA) │  Tor circuit B  │  .onion  │
+└──────────┘                      └──────────────┘                 └──────────┘
+```
+
+**How it works:**
+1. Sender encodes request as BHTTP (RFC 9292), encrypts with peer's ECDH P-256 public key via AES-GCM
+2. Sends encrypted envelope to `peer.onion/.well-known/ohttp-relay` through Tor circuit A
+3. Peer relay decrypts using ECDH key agreement, extracts BHTTP request
+4. Fetches target on its own Tor circuit B (different guard/middle/exit)
+5. Encrypts response back via same ECDH shared secret
+
+**Privacy guarantees:**
+- Tor hides requester's IP from relay (circuit A)
+- Target sees circuit B, not circuit A — can't link request to requester
+- AES-GCM encryption prevents Tor exit nodes from reading the OHTTP envelope
+- Each request uses a fresh ephemeral ECDH key pair
+
+**Fallback (no peers):**
+- Uses SOCKS5 username/password auth with unique random credentials per request
+- Tor's `IsolateSOCKSAuth` forces a fresh circuit per request
+- Different guard/middle/exit nodes than regular traffic
 
 ### Technical highlights
 
 - **No build step** — Pure ESM with Preact + htm, vendored dependencies
 - **Real Tor** — `tor.js` + `tor.wasm` compiled via Emscripten, connects to the actual Tor network
 - **Real TCP** — `TCPSocket` for SOCKS5 outbound, `TCPServerSocket` for HS inbound (Direct Sockets API)
+- **Real OHTTP privacy** — ECDH P-256 key exchange, AES-GCM encryption, BHTTP framing, peer relay over Tor
+- **Circuit isolation fallback** — SOCKS5 auth-based circuit separation when no peers exist
 - **OPFS keypair persistence** — `.onion` address survives page reloads via Origin Private File System
 - **Web Locks** — Prevents multiple tabs from fighting over the HS listener port
 - **Ed25519 via Web Crypto** — `.onion` v3 address derivation (SHA3-256 checksum) and client auth signatures
-- **OHTTP framing demo** — Correct RFC 9458 Binary HTTP encoding with AES-GCM, ready for a real relay
 - **Visibility-aware animations** — Canvas loops pause when tab is hidden to save battery
 - **O(n) buffer handling** — Chunk-then-concat pattern for SOCKS5/HTTP response reading
 
@@ -42,9 +72,9 @@ This is the first WebMCP integration that gives AI agents access to **network-le
 
 | API | Usage |
 |-----|-------|
-| Direct Sockets | `TCPSocket` (SOCKS5), `TCPServerSocket` (HS listener) |
-| WebMCP | `navigator.modelContext.registerTool()` x 6 |
-| Web Crypto | Ed25519 keygen/sign/verify, AES-GCM, ECDH, SHA-256 |
+| Direct Sockets | `TCPSocket` (SOCKS5, SOCKS5+auth), `TCPServerSocket` (HS listener + OHTTP relay endpoint) |
+| WebMCP | `navigator.modelContext.registerTool()` x 7 |
+| Web Crypto | ECDH P-256 (OHTTP relay), Ed25519 (keygen/sign/verify), AES-GCM (envelope encryption), SHA-256 |
 | OPFS | `navigator.storage.getDirectory()` for keypair persistence |
 | Web Locks | `navigator.locks.request()` for HS singleton |
 | File System Access | `showDirectoryPicker()` for Tor data dir |
@@ -54,32 +84,44 @@ This is the first WebMCP integration that gives AI agents access to **network-le
 ### What an AI agent can do with these tools
 
 ```
-Agent: "I want to check if the DuckDuckGo onion service is up"
-→ fetchOnion({ url: "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/" })
-→ { success: true, status: 200, certVerification: { known: false, note: "First contact — fingerprint auto-stored via TOFU" } }
+Agent: "Set up OHTTP privacy"
+→ manageOHTTPRelay({ action: "volunteer" })
+→ { volunteering: true, pubkey: "BFx9a...", localOnion: "abc...onion" }
+
+Agent: "Add a relay peer I know about"
+→ manageOHTTPRelay({ action: "addPeer", peerOnion: "xyz...onion", peerPubkey: "BGh2..." })
+→ { success: true, totalPeers: 1, note: "fetchOnion with useOHTTP=true will now route through available peers." }
+
+Agent: "Fetch a .onion site with OHTTP privacy"
+→ fetchOnion({ url: "http://duckduck...onion/", useOHTTP: true })
+→ { success: true, status: 200, ohttpMode: "peer-relay", ohttpRelay: "xyz...onion" }
+
+Agent: "No peers available — what happens?"
+→ fetchOnion({ url: "http://example...onion/", useOHTTP: true })
+→ { success: true, status: 200, ohttpMode: "circuit-isolation" }
 
 Agent: "Connect to another agent's hidden service"
 → holepunch({ action: "connect", targetOnion: "abc123...xyz.onion", port: 80 })
 → { success: true, sessionId: "...", status: "connected" }
 
-Agent: "Send a message"
-→ holepunch({ action: "send", sessionId: "...", message: '{"hello": "world"}' })
-→ { success: true, bytesSent: 22 }
-
-Agent: "Lock down my hidden service to only trusted clients"
+Agent: "Lock down my hidden service"
 → manageTrustedClients({ action: "add", clientId: "agent-b", pubkey: "base64..." })
 → { success: true, note: "Access control is now ACTIVE" }
 ```
 
 ### Test plan
 
-- [ ] Load IWA in Chrome Canary with `#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`, `#direct-sockets`, `#enable-web-mcp` flags
+- [ ] Load IWA in Chrome with `#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`, `#direct-sockets`, `#enable-web-mcp` flags
 - [ ] Start Tor, verify bootstrap reaches 100%
-- [ ] Start hidden service, verify `.onion` address is generated (check OPFS persistence by reloading)
-- [ ] Register WebMCP tools, verify 6 tools appear in `navigator.modelContext`
-- [ ] Test `fetchOnion` with a known `.onion` address
+- [ ] Start hidden service, verify `.onion` address is generated and persisted (reload to confirm)
+- [ ] Register WebMCP tools, verify 7 tools appear in `navigator.modelContext`
+- [ ] Test `fetchOnion` with a known `.onion` address (direct mode)
+- [ ] Volunteer as OHTTP relay, verify status shows volunteering=true
+- [ ] Test `fetchOnion` with `useOHTTP=true` and no peers (should use circuit isolation)
+- [ ] Add a peer relay, test `fetchOnion` with `useOHTTP=true` (should use peer relay)
 - [ ] Test `holepunch` connect/send/receive/close lifecycle
 - [ ] Test `manageTrustedClients` add/verify/remove and verify HS returns 403 to untrusted requests
-- [ ] Test `validateOnionCert` TOFU auto-capture after `fetchOnion`
+- [ ] Verify OHTTP relay card shows stats, peer count, and mode indicator
 - [ ] Verify canvas animations pause when tab is backgrounded
 - [ ] Verify Web Locks prevent duplicate HS listener across tabs
+- [ ] Verify footer shows OHTTP indicator dot

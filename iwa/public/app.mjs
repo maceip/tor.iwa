@@ -5,11 +5,13 @@ import {
   registerWebMCPTools, unregisterWebMCPTools,
   onionCertStore, trustedClients, holepunchSessions,
   fetchLog,
+  getRelayPeers, getRelayStats, isRelayVolunteering,
 } from './webmcp.mjs';
 import {
   startHiddenServiceListener, stopHiddenServiceListener,
   setRequestHandler, getServerStatus as getTorServerStatus,
   setLocalOnionAddress,
+  startRelayVolunteer, stopRelayVolunteer,
 } from './tor-fetch.mjs';
 const html = htm.bind(h);
 
@@ -107,6 +109,11 @@ const S = {
   webmcpCerts: [],
   webmcpClients: [],
   webmcpSessions: [],
+  // OHTTP relay state
+  relayVolunteering: false,
+  relayPeerCount: 0,
+  relayStats: { requestsRelayed: 0, bytesRelayed: 0, lastRelayedAt: null },
+  relayPubkey: null,
   _subs: new Set(),
 };
 function emit() { S._subs.forEach(fn => fn()); }
@@ -1219,6 +1226,10 @@ function refreshWebMCPState() {
   }));
   S.webmcpClients = Array.from(trustedClients.entries()).map(([, c]) => c);
   S.webmcpSessions = Array.from(holepunchSessions.entries()).map(([, s]) => s);
+  // Relay state
+  S.relayVolunteering = isRelayVolunteering();
+  S.relayPeerCount = getRelayPeers().size;
+  S.relayStats = getRelayStats();
   emit();
 }
 
@@ -1292,6 +1303,83 @@ function setupWebMCPListeners() {
     addLog('[WebMCP] All trusted clients cleared — access control disabled', 'warn');
     refreshWebMCPState();
   });
+
+  // OHTTP relay events
+  window.addEventListener('webmcp:relay-started', (e) => {
+    addLog('[WebMCP] OHTTP relay volunteering started — accepting relay requests', 'ok');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-stopped', () => {
+    addLog('[WebMCP] OHTTP relay stopped', 'warn');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-peer-added', (e) => {
+    const { peerOnion } = e.detail;
+    addLog('[WebMCP] OHTTP relay peer added: ' + peerOnion.slice(0, 16) + '...', 'ok');
+    refreshWebMCPState();
+  });
+
+  window.addEventListener('webmcp:relay-peer-removed', (e) => {
+    const { peerOnion } = e.detail;
+    addLog('[WebMCP] OHTTP relay peer removed: ' + peerOnion.slice(0, 16) + '...', 'warn');
+    refreshWebMCPState();
+  });
+}
+
+function OHTTPRelayCard({ volunteering, peerCount, stats, onVolunteer, onStop }) {
+  return html`
+    <div class="card relay-card ${volunteering ? 'active' : ''}">
+      <div class="card-head">
+        OHTTP Relay
+        <span class="hs-status-dot ${volunteering ? 'on' : ''}"></span>
+      </div>
+      <div class="card-body">
+        <div class="relay-mode-row">
+          <span class="relay-mode-label">Mode</span>
+          <span class="relay-mode-val ${peerCount > 0 ? 'ok' : 'dim'}">
+            ${peerCount > 0 ? 'Peer Relay (' + peerCount + ' peer' + (peerCount > 1 ? 's' : '') + ')' : 'Circuit Isolation (no peers)'}
+          </span>
+        </div>
+
+        <div class="hs-stats-grid">
+          <div class="hs-stat">
+            <div class="hs-stat-val">${stats.requestsRelayed || 0}</div>
+            <div class="hs-stat-label">Relayed</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${stats.bytesRelayed ? formatBytes(stats.bytesRelayed) : '0 B'}</div>
+            <div class="hs-stat-label">Bytes</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${peerCount}</div>
+            <div class="hs-stat-label">Peers</div>
+          </div>
+          <div class="hs-stat">
+            <div class="hs-stat-val">${volunteering ? 'Yes' : 'No'}</div>
+            <div class="hs-stat-label">Volunteer</div>
+          </div>
+        </div>
+
+        <div class="hs-serve-info">
+          ${volunteering ? html`
+            <div class="hs-serve-line">Accepting OHTTP requests at <span class="mono">/.well-known/ohttp-relay</span></div>
+            <div class="hs-serve-line">Peers encrypt to your ECDH public key via BHTTP + AES-GCM</div>
+          ` : html`
+            <div class="hs-serve-line dim">Not volunteering as relay</div>
+            <div class="hs-serve-line dim">${peerCount > 0 ? 'Outbound OHTTP via peer relay' : 'Outbound OHTTP via circuit isolation (IsolateSOCKSAuth)'}</div>
+          `}
+        </div>
+
+        <div class="hs-buttons">
+          <button class=${volunteering ? 'danger' : 'primary'} onClick=${volunteering ? onStop : onVolunteer}>
+            ${volunteering ? 'Stop Relay' : 'Volunteer as Relay'}
+          </button>
+        </div>
+      </div>
+    </div>
+  `;
 }
 
 function WebMCPCard({ available, enabled, onEnable, onDisable }) {
@@ -1299,12 +1387,13 @@ function WebMCPCard({ available, enabled, onEnable, onDisable }) {
   const [expanded, setExpanded] = useState(false);
 
   const toolDefs = [
-    { name: 'holepunch', desc: 'NAT holepunch to .onion targets' },
+    { name: 'holepunch', desc: 'Peer connections to .onion targets' },
     { name: 'validateOnionCert', desc: 'Cert fingerprint store/verify' },
     { name: 'manageTrustedClients', desc: 'Client trust management' },
     { name: 'listHolepunchSessions', desc: 'Active holepunch sessions' },
     { name: 'getServiceStatus', desc: 'Hidden service status' },
-    { name: 'fetchOnion', desc: 'Fetch .onion via SOCKS5 + OHTTP' },
+    { name: 'fetchOnion', desc: 'Fetch .onion + OHTTP relay/isolation' },
+    { name: 'manageOHTTPRelay', desc: 'OHTTP relay + peer management' },
   ];
 
   return html`
@@ -1321,7 +1410,7 @@ function WebMCPCard({ available, enabled, onEnable, onDisable }) {
 
         <div class="webmcp-actions">
           ${!enabled && html`
-            <button class="primary" onClick=${onEnable} disabled=${!available}>Register 6 Tools</button>
+            <button class="primary" onClick=${onEnable} disabled=${!available}>Register 7 Tools</button>
           `}
           ${enabled && html`
             <button class="danger" onClick=${onDisable}>Unregister</button>
@@ -1503,11 +1592,31 @@ function App() {
 
   const toggleVanity = useCallback(() => { S.vanityOpen = !S.vanityOpen; emit(); }, []);
 
+  const startRelay = useCallback(async () => {
+    try {
+      const result = await startRelayVolunteer();
+      S.relayVolunteering = true;
+      S.relayPubkey = result.pubkey;
+      addLog('[OHTTP] Relay volunteering started — pubkey: ' + result.pubkey.slice(0, 24) + '...', 'ok');
+      emit();
+    } catch (e) {
+      addLog('[OHTTP] Failed to start relay: ' + e.message, 'err');
+    }
+  }, []);
+
+  const stopRelay = useCallback(async () => {
+    await stopRelayVolunteer();
+    S.relayVolunteering = false;
+    S.relayPubkey = null;
+    addLog('[OHTTP] Relay stopped', 'warn');
+    emit();
+  }, []);
+
   const enableWebMCP = useCallback(() => {
     const ok = registerWebMCPTools();
     if (ok) {
       S.webmcpEnabled = true;
-      addLog('[WebMCP] 6 tools registered for AI agents (incl. fetchOnion + OHTTP)', 'ok');
+      addLog('[WebMCP] 7 tools registered for AI agents (incl. OHTTP relay)', 'ok');
       emit();
     } else {
       addLog('[WebMCP] Failed to register — modelContext not available', 'warn');
@@ -1595,6 +1704,16 @@ function App() {
           onEnable=${enableWebMCP}
           onDisable=${disableWebMCP}
         />
+        <${OHTTPRelayCard}
+          volunteering=${s.relayVolunteering}
+          peerCount=${s.relayPeerCount}
+          stats=${s.relayStats}
+          onVolunteer=${startRelay}
+          onStop=${stopRelay}
+        />
+      </div>
+
+      <div class="dash">
         <div class="card throughput-card ${s.vanityOpen ? 'hidden-by-vanity' : ''}">
           <div class="card-head">Throughput</div>
           <div class="card-body">
@@ -1622,6 +1741,9 @@ function App() {
         </div>
         <div class="footer-indicator ${s.webmcpEnabled ? 'mcp on' : 'mcp'}">
           <span class="fdot"></span><span>MCP</span>
+        </div>
+        <div class="footer-indicator ${s.relayVolunteering ? 'relay on' : 'relay'}">
+          <span class="fdot"></span><span>OHTTP</span>
         </div>
       </div>
       <span class="footer-sep">\u2502</span>
