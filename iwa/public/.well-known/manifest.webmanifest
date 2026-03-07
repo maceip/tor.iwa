@@ -50,6 +50,10 @@
       {
         "name": "fetchOnion",
         "description": "Fetch .onion URLs through this IWA's Tor circuit via SOCKS5. Returns HTTP response with TOFU cert verification. Optional OHTTP encapsulation for additional privacy."
+      },
+      {
+        "name": "manageOHTTPRelay",
+        "description": "Manage OHTTP relay infrastructure. Volunteer as relay, add/remove peers, check status. Enables real application-layer privacy via peer relay mesh."
       }
     ]
   }

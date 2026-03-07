@@ -112,6 +112,126 @@ When an AI agent calls `fetchOnion({ url: "...", useOHTTP: true })`:
 **Fallback — no peers available:**
 Uses SOCKS5 username/password auth with a unique random credential per request. Tor's `IsolateSOCKSAuth` forces a fresh circuit, so each OHTTP request goes through different guard/middle/exit nodes than your regular traffic.
 
+## The MCP Boundary Problem (and 3 Paths We're Building)
+
+This is the hard part. IWAs and extensions live in different worlds, and Chrome's security model makes connecting them non-trivial. Here's exactly where the boundaries are and what we're doing about it.
+
+### The Problem
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Chrome Browser                              │
+│                                                                    │
+│  ┌───────────────────────┐          ┌──────────────────────────┐   │
+│  │    Extension          │          │    IWA (tor.iwa)          │   │
+│  │    (MCP client)       │          │    (MCP tools live here)  │   │
+│  │                       │    ✗     │                           │   │
+│  │  Wants to call        │◄──┼────►│  Has 7 tools registered   │   │
+│  │  fetchOnion, etc.     │    ✗     │  via navigator.modelContext│  │
+│  │                       │          │                           │   │
+│  └───────────────────────┘          └──────────────────────────┘   │
+│                                                                    │
+│  WHY THE ✗?                                                        │
+│  • IWAs have isolated-app:// origins — not https://                │
+│  • Chrome blocks content script injection into IWAs                │
+│  • externally_connectable doesn't work with isolated-app://        │
+│  • chrome.tabs.sendMessage can't reach IWA windows                 │
+│  • BroadcastChannel is same-origin only                            │
+│  • No shared DOM, no shared workers across these origins            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+Extensions are the primary way people use WebMCP today. But extensions **cannot inject content scripts into IWAs**, cannot use `externally_connectable` with `isolated-app://` origins, and cannot use `chrome.tabs.sendMessage` to reach IWA windows. This is by design — IWAs are security-hardened contexts.
+
+We don't know which approach Chrome will eventually support for IWA-extension communication, so **we're building all three paths** and asking the community to evaluate them:
+
+### Path 1: Native WebMCP (already works)
+
+```js
+// Inside the IWA — this works today with chrome://flags/#enable-web-mcp
+navigator.modelContext.registerTool('fetchOnion', { ... }, handler);
+```
+
+The IWA calls `navigator.modelContext.registerTool()` directly. Chrome's built-in MCP infrastructure handles discovery and dispatch. **This is the cleanest path** — no bridge code, no relay, no workarounds. The catch: the `#enable-web-mcp` flag must be enabled, and it's Chrome-only.
+
+**Status:** Implemented. 7 tools registered. Works today.
+
+### Path 2: MCP JSON-RPC Server over the Hidden Service
+
+```
+┌──────────────┐     Tor circuit      ┌───────────────────────────┐
+│ Any MCP      │ ───────────────────→ │ tor.iwa Hidden Service    │
+│ client       │  POST /.well-known/  │                           │
+│ (extension,  │       mcp            │ JSON-RPC handler          │
+│  CLI, agent) │ ←─────────────────── │ dispatches to same 7 tools│
+└──────────────┘                      └───────────────────────────┘
+```
+
+The hidden service already listens on a `TCPServerSocket`. We add a standard MCP JSON-RPC endpoint at `/.well-known/mcp`. **Any MCP client that can reach the `.onion` address** — an extension routing through Tor, a CLI tool, another agent — can discover and call tools via standard JSON-RPC over HTTP.
+
+This completely sidesteps the IWA isolation problem. The communication doesn't go through Chrome's extension APIs at all — it goes through the Tor network to the hidden service's TCP socket.
+
+```
+GET  /.well-known/mcp              → Server info + capabilities
+POST /.well-known/mcp              → JSON-RPC (tools/list, tools/call)
+```
+
+Example:
+```json
+// Request
+{"jsonrpc":"2.0","id":1,"method":"tools/list"}
+
+// Response
+{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"fetchOnion",...},...]}}
+
+// Tool call
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetchOnion","arguments":{"url":"http://...onion/"}}}
+```
+
+**Status:** Implemented. Enable with "Start MCP Server" button. Serves JSON-RPC at `your.onion/.well-known/mcp`.
+
+### Path 3: BroadcastChannel / postMessage Bridge
+
+```
+┌──────────────────┐   window.postMessage   ┌──────────────────────┐
+│ Extension popup  │ ◄───────────────────►  │ IWA window           │
+│ or bridge page   │   (if window ref       │ (listens for mcp:*   │
+│                  │    can be obtained)     │  prefixed messages)  │
+└──────────────────┘                        └──────────────────────┘
+```
+
+The IWA opens a `BroadcastChannel('tor-iwa-mcp')` and a `window.postMessage` listener. Any code that can get a reference to the IWA window (e.g., if the IWA was opened via `window.open()`, or through a shared `BroadcastChannel` on the same origin) can send tool calls.
+
+**Honest assessment:** This is the most limited path. `BroadcastChannel` is same-origin only, so it won't work cross-origin between an extension and an IWA. `window.postMessage` requires a window reference, which extensions typically can't get for IWA windows. But we're implementing it because:
+1. It works for same-origin IWA-to-IWA communication
+2. Chrome may add cross-origin IWA messaging in the future
+3. It demonstrates the communication pattern the community wants
+
+Message protocol:
+```js
+// Discovery
+postMessage({ type: 'mcp:ping' })
+// → { type: 'mcp:pong', source: 'tor-iwa', tools: 7 }
+
+// List tools
+postMessage({ type: 'mcp:tools/list' })
+// → { type: 'mcp:tools/list:result', tools: [...] }
+
+// Call a tool
+postMessage({ type: 'mcp:tools/call', name: 'fetchOnion', arguments: { url: '...' }, id: '123' })
+// → { type: 'mcp:tools/call:result', name: 'fetchOnion', id: '123', result: { ... } }
+```
+
+**Status:** Implemented. Enable with "Start Bridge" button. Listening on BroadcastChannel + postMessage.
+
+### Which Path Should Chrome Support?
+
+We think **Path 1 (native WebMCP) is the right answer** — it's clean, secure, and doesn't require workarounds. But until `navigator.modelContext` is widely available and extensions can discover IWA-registered tools, we need Paths 2 and 3 as alternatives.
+
+**If you're from the Chrome team:** We'd love guidance on the intended IWA-extension communication model. Should IWAs be able to register as `externally_connectable`? Should there be a cross-origin messaging API for isolated apps? We're building this to help figure out the right answer.
+
+**If you're a developer:** Try all three paths and tell us which works for your use case. File issues, open PRs, help us convince Chrome to support IWA-extension communication natively.
+
 ## The 7 WebMCP Tools
 
 | Tool | What It Does |
@@ -127,34 +247,38 @@ Uses SOCKS5 username/password auth with a unique random credential per request. 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│  Chrome IWA Window                                  │
-│                                                     │
-│  ┌──────────┐  ┌────────────┐  ┌────────────────┐  │
-│  │ Tor WASM │  │ UI (Preact)│  │ OHTTP Relay    │  │
-│  │ (tor.js) │  │ (app.mjs)  │  │ (ECDH+AES-GCM) │  │
-│  └────┬─────┘  └─────┬──────┘  └───────┬────────┘  │
-│       │               │                │            │
-│  ┌────▼─────┐  ┌──────▼──────┐  ┌──────▼───────┐   │
-│  │ SOCKS5   │  │  WebMCP     │  │ Circuit      │   │
-│  │ :9050    │  │  7 tools    │  │ Isolation    │   │
-│  └────┬─────┘  └──────┬──────┘  └──────┬───────┘   │
-│       │               │               │            │
-│  ┌────▼───────────────▼───────────────▼────┐       │
-│  │          Direct Sockets API             │       │
-│  │  TCPSocket (SOCKS5) + TCPServer (HS)    │       │
-│  └────┬────────────────────────────────────┘       │
-│       │                                            │
-│  ┌────▼─────┐  ┌──────────────────────────┐        │
-│  │ HS :8080 │  │ /.well-known/ohttp-relay │        │
-│  └──────────┘  └──────────────────────────┘        │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  Chrome IWA Window (isolated-app:// origin)                    │
+│                                                                │
+│  ┌──────────┐  ┌────────────┐  ┌──────────────────────────┐   │
+│  │ Tor WASM │  │ UI (Preact)│  │ OHTTP Relay (ECDH+AES)  │   │
+│  │ (tor.js) │  │ (app.mjs)  │  │ /.well-known/ohttp-relay│   │
+│  └────┬─────┘  └─────┬──────┘  └───────────┬─────────────┘   │
+│       │               │                     │                  │
+│  ┌────▼─────┐  ┌──────▼──────────────┐  ┌──▼──────────────┐  │
+│  │ SOCKS5   │  │  3 MCP Paths:       │  │ Circuit         │  │
+│  │ :9050    │  │  ① WebMCP (native)  │  │ Isolation       │  │
+│  │          │  │  ② JSON-RPC on HS   │  │ (SOCKS5 auth)   │  │
+│  │          │  │  ③ postMessage      │  │                 │  │
+│  └────┬─────┘  └──────┬──────────────┘  └──┬──────────────┘  │
+│       │               │                     │                  │
+│  ┌────▼───────────────▼─────────────────────▼──────┐          │
+│  │             Direct Sockets API                  │          │
+│  │   TCPSocket (SOCKS5) + TCPServerSocket (HS)     │          │
+│  └────┬────────────────────────────────────────────┘          │
+│       │                                                        │
+│  ┌────▼────────────────────────────────────────────┐          │
+│  │  Hidden Service :8080                           │          │
+│  │  /.well-known/ohttp-relay  (OHTTP relay)        │          │
+│  │  /.well-known/mcp          (MCP JSON-RPC)       │          │
+│  └─────────────────────────────────────────────────┘          │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-**Key connections:**
-- `tor-fetch.mjs` — SOCKS5 client, circuit isolation (`socks5ConnectIsolated`), OHTTP relay handler, BHTTP codec, ECDH key exchange
-- `webmcp.mjs` — Registers 7 tools with `navigator.modelContext`, manages relay peer registry, cert store, trusted clients
-- `app.mjs` — Preact UI with OHTTP relay card, live dashboards, canvas visualizations
+**Key modules:**
+- `tor-fetch.mjs` — SOCKS5 client, circuit isolation, OHTTP relay handler, MCP JSON-RPC endpoint, BHTTP codec, ECDH key exchange
+- `webmcp.mjs` — 7 tool implementations, MCP JSON-RPC dispatch, BroadcastChannel/postMessage bridge, relay peer registry, cert store, trusted clients
+- `app.mjs` — Preact UI with OHTTP relay card, MCP path status, live dashboards, canvas visualizations
 
 ## Browser APIs Used
 
@@ -177,13 +301,13 @@ iwa/public/
   index.html              — Shell HTML with meta/OG tags
   app.mjs                 — UI (Preact + htm, no build step)
   app.css                 — Styles
-  tor-fetch.mjs           — SOCKS5 client, HS listener, OHTTP relay, circuit isolation
-  webmcp.mjs              — 7 WebMCP tool implementations
+  tor-fetch.mjs           — SOCKS5 client, HS listener, OHTTP relay, MCP JSON-RPC endpoint, circuit isolation
+  webmcp.mjs              — 7 tool implementations + MCP JSON-RPC handler + BroadcastChannel bridge
   sw.js                   — Service worker
   icon-192.png            — App icon
   icon-512.png            — App icon (large)
   og-image.png            — Social sharing image
-  .well-known/manifest.webmanifest — IWA manifest with webmcp.tools
+  .well-known/manifest.webmanifest — IWA manifest with 7 webmcp.tools
   lib/                    — Preact, preact-hooks, htm (vendored)
 ```
 

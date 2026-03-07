@@ -6,6 +6,8 @@ import {
   onionCertStore, trustedClients, holepunchSessions,
   fetchLog,
   getRelayPeers, getRelayStats, isRelayVolunteering,
+  enableMCPServer, disableMCPServer, isMCPServerActive,
+  enableBridge, disableBridge, isBridgeActive, getBridgeStats,
 } from './webmcp.mjs';
 import {
   startHiddenServiceListener, stopHiddenServiceListener,
@@ -114,6 +116,10 @@ const S = {
   relayPeerCount: 0,
   relayStats: { requestsRelayed: 0, bytesRelayed: 0, lastRelayedAt: null },
   relayPubkey: null,
+  // MCP paths state
+  mcpServerActive: false,
+  bridgeActive: false,
+  bridgeStats: { messagesReceived: 0, toolCallsHandled: 0, lastMessageAt: null },
   _subs: new Set(),
 };
 function emit() { S._subs.forEach(fn => fn()); }
@@ -1230,6 +1236,10 @@ function refreshWebMCPState() {
   S.relayVolunteering = isRelayVolunteering();
   S.relayPeerCount = getRelayPeers().size;
   S.relayStats = getRelayStats();
+  // MCP paths state
+  S.mcpServerActive = isMCPServerActive();
+  S.bridgeActive = isBridgeActive();
+  S.bridgeStats = getBridgeStats();
   emit();
 }
 
@@ -1326,6 +1336,26 @@ function setupWebMCPListeners() {
     addLog('[WebMCP] OHTTP relay peer removed: ' + peerOnion.slice(0, 16) + '...', 'warn');
     refreshWebMCPState();
   });
+
+  // MCP server events
+  window.addEventListener('webmcp:mcp-server-started', () => {
+    addLog('[MCP] JSON-RPC server active at /.well-known/mcp', 'ok');
+    refreshWebMCPState();
+  });
+  window.addEventListener('webmcp:mcp-server-stopped', () => {
+    addLog('[MCP] JSON-RPC server stopped', 'warn');
+    refreshWebMCPState();
+  });
+
+  // Bridge events
+  window.addEventListener('webmcp:bridge-started', () => {
+    addLog('[MCP] BroadcastChannel + postMessage bridge active', 'ok');
+    refreshWebMCPState();
+  });
+  window.addEventListener('webmcp:bridge-stopped', () => {
+    addLog('[MCP] Bridge stopped', 'warn');
+    refreshWebMCPState();
+  });
 }
 
 function OHTTPRelayCard({ volunteering, peerCount, stats, onVolunteer, onStop }) {
@@ -1382,7 +1412,7 @@ function OHTTPRelayCard({ volunteering, peerCount, stats, onVolunteer, onStop })
   `;
 }
 
-function WebMCPCard({ available, enabled, onEnable, onDisable }) {
+function WebMCPCard({ available, enabled, onEnable, onDisable, mcpServerActive, bridgeActive, bridgeStats, onToggleMCPServer, onToggleBridge }) {
   const s = useStore();
   const [expanded, setExpanded] = useState(false);
 
@@ -1425,6 +1455,29 @@ function WebMCPCard({ available, enabled, onEnable, onDisable }) {
                 <span class="webmcp-chip-desc">${t.desc}</span>
               </div>
             `)}
+          </div>
+
+          <div class="webmcp-paths-section">
+            <div class="webmcp-status-row">
+              <span class="webmcp-label">Path 1: Native WebMCP</span>
+              <span class="webmcp-val ${enabled ? 'ok' : 'dim'}">${enabled ? 'Active' : 'Off'}</span>
+            </div>
+            <div class="webmcp-status-row">
+              <span class="webmcp-label">Path 2: MCP-over-HS</span>
+              <span class="webmcp-val ${mcpServerActive ? 'ok' : 'dim'}">${mcpServerActive ? '/.well-known/mcp' : 'Off'}</span>
+            </div>
+            <div class="webmcp-status-row">
+              <span class="webmcp-label">Path 3: postMessage</span>
+              <span class="webmcp-val ${bridgeActive ? 'ok' : 'dim'}">${bridgeActive ? 'Listening' + (bridgeStats.toolCallsHandled > 0 ? ' (' + bridgeStats.toolCallsHandled + ' calls)' : '') : 'Off'}</span>
+            </div>
+            <div class="webmcp-actions">
+              <button class=${mcpServerActive ? 'danger' : ''} onClick=${onToggleMCPServer} disabled=${!enabled}>
+                ${mcpServerActive ? 'Stop MCP Server' : 'Start MCP Server'}
+              </button>
+              <button class=${bridgeActive ? 'danger' : ''} onClick=${onToggleBridge} disabled=${!enabled}>
+                ${bridgeActive ? 'Stop Bridge' : 'Start Bridge'}
+              </button>
+            </div>
           </div>
 
           <div class="webmcp-data-toggle" onClick=${() => setExpanded(!expanded)}>
@@ -1625,8 +1678,37 @@ function App() {
 
   const disableWebMCP = useCallback(() => {
     unregisterWebMCPTools();
+    // Also stop MCP server and bridge
+    if (isMCPServerActive()) disableMCPServer();
+    if (isBridgeActive()) disableBridge();
     S.webmcpEnabled = false;
+    S.mcpServerActive = false;
+    S.bridgeActive = false;
     addLog('[WebMCP] Tools unregistered', 'warn');
+    emit();
+  }, []);
+
+  const toggleMCPServer = useCallback(() => {
+    if (isMCPServerActive()) {
+      disableMCPServer();
+      S.mcpServerActive = false;
+    } else {
+      enableMCPServer();
+      S.mcpServerActive = true;
+    }
+    addLog(S.mcpServerActive ? '[MCP] Path 2: JSON-RPC server enabled at /.well-known/mcp' : '[MCP] Path 2: JSON-RPC server disabled', S.mcpServerActive ? 'ok' : 'warn');
+    emit();
+  }, []);
+
+  const toggleBridge = useCallback(() => {
+    if (isBridgeActive()) {
+      disableBridge();
+      S.bridgeActive = false;
+    } else {
+      enableBridge();
+      S.bridgeActive = true;
+    }
+    addLog(S.bridgeActive ? '[MCP] Path 3: BroadcastChannel + postMessage bridge enabled' : '[MCP] Path 3: Bridge disabled', S.bridgeActive ? 'ok' : 'warn');
     emit();
   }, []);
 
@@ -1703,6 +1785,11 @@ function App() {
           enabled=${s.webmcpEnabled}
           onEnable=${enableWebMCP}
           onDisable=${disableWebMCP}
+          mcpServerActive=${s.mcpServerActive}
+          bridgeActive=${s.bridgeActive}
+          bridgeStats=${s.bridgeStats}
+          onToggleMCPServer=${toggleMCPServer}
+          onToggleBridge=${toggleBridge}
         />
         <${OHTTPRelayCard}
           volunteering=${s.relayVolunteering}
@@ -1744,6 +1831,9 @@ function App() {
         </div>
         <div class="footer-indicator ${s.relayVolunteering ? 'relay on' : 'relay'}">
           <span class="fdot"></span><span>OHTTP</span>
+        </div>
+        <div class="footer-indicator ${s.mcpServerActive ? 'rpc on' : 'rpc'}">
+          <span class="fdot"></span><span>RPC</span>
         </div>
       </div>
       <span class="footer-sep">\u2502</span>

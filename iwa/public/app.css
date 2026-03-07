@@ -501,6 +501,16 @@ main { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; 
   font-size: 7px; color: var(--text-dim);
 }
 
+.webmcp-paths-section {
+  padding: 6px 0;
+  border-top: 1px solid rgba(42,42,90,0.25);
+  border-bottom: 1px solid rgba(42,42,90,0.25);
+  display: flex; flex-direction: column; gap: 4px;
+}
+.webmcp-paths-section .webmcp-actions {
+  margin-top: 4px;
+}
+
 .webmcp-data-toggle {
   padding: 4px 0; font-size: 9px; color: var(--text-dim); cursor: pointer;
   display: flex; align-items: center; gap: 6px; user-select: none;
@@ -599,6 +609,7 @@ footer {
 .footer-indicator.tor .fdot { background: var(--cyan); }
 .footer-indicator.hs .fdot { background: var(--green); }
 .footer-indicator.mcp .fdot { background: var(--accent); }
+.footer-indicator.rpc.on .fdot { background: var(--yellow); box-shadow: 0 0 6px rgba(255,204,0,0.5); }
 .footer-sep { color: rgba(136,136,170,0.3); }
 
 /* ── Responsive ── */
