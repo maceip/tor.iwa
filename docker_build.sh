@@ -471,7 +471,7 @@ export tor_cv_openssl_is_nss=no
 emconfigure ./configure \
   --host=wasm32-unknown-emscripten \
   --build=$(gcc -dumpmachine 2>/dev/null || echo x86_64-linux-gnu) \
-  --disable-module-relay \
+  --enable-module-relay \
   --disable-module-dirauth \
   --disable-seccomp \
   --disable-libscrypt \
