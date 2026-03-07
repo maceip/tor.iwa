@@ -1,5 +1,5 @@
 // Service Worker for Tor IWA
-const CACHE_NAME = 'tor-iwa-v6';
+const CACHE_NAME = 'tor-iwa-v7';
 const ASSETS = [
   '/',
   '/index.html',
@@ -13,6 +13,9 @@ const ASSETS = [
   '/lib/preact.mjs',
   '/lib/preact-hooks.mjs',
   '/lib/htm.mjs',
+  '/icon-192.png',
+  '/icon-512.png',
+  '/og-image.png',
 ];
 
 self.addEventListener('install', event => {

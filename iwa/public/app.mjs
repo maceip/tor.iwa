@@ -1013,7 +1013,7 @@ function formatBytes(b) {
 function HiddenServiceCard({ running, address, stats, onStart, onStop }) {
   const display = address || 'not running';
   return html`
-    <div class="card hs-card ${running ? 'running' : ''}"
+    <div class="card hs-card ${running ? 'running' : ''}">
       <div class="card-head">
         Hidden Service
         <span class="hs-status-dot ${running ? 'on' : ''}"></span>
@@ -1261,7 +1261,7 @@ function WebMCPCard({ available, enabled, onEnable, onDisable }) {
   ];
 
   return html`
-    <div class="card webmcp-card ${enabled ? 'active' : ''}"
+    <div class="card webmcp-card ${enabled ? 'active' : ''}">
       <div class="card-head">
         WebMCP
         <span class="webmcp-badge ${enabled ? 'active' : ''}">${enabled ? 'ACTIVE' : available ? 'READY' : 'N/A'}</span>
