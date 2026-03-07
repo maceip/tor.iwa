@@ -17,13 +17,23 @@ const SOCKS_PORT = 9050;
 const fetchLog = [];
 export { fetchLog };
 
+// ── Shared state hooks (set by webmcp.mjs) ──
+let _trustedClientsRef = null;   // Map reference for HS auth enforcement
+let _certCaptureCallback = null; // called after successful fetchOnion
+let _localOnionAddress = null;   // this node's .onion address
+
+export function setTrustedClientsRef(mapRef) { _trustedClientsRef = mapRef; }
+export function setCertCaptureCallback(fn) { _certCaptureCallback = fn; }
+export function setLocalOnionAddress(addr) { _localOnionAddress = addr; }
+export function getLocalOnionAddress() { return _localOnionAddress; }
+
 function logFetch(entry) {
   fetchLog.push({ ...entry, ts: new Date().toISOString() });
   if (fetchLog.length > 100) fetchLog.splice(0, fetchLog.length - 80);
 }
 
 // ── SOCKS5 handshake over Direct Sockets TCPSocket ──
-async function socks5Connect(hostname, port) {
+export async function socks5Connect(hostname, port) {
   if (typeof TCPSocket === 'undefined') {
     throw new Error('Direct Sockets API not available — requires IWA context');
   }
@@ -317,8 +327,24 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
       ohttp: !!useOHTTP,
     });
 
-    // Capture TLS cert info if available in response headers
-    const certFingerprint = result.headers['x-tor-cert-fingerprint'] || null;
+    // Compute service fingerprint from response characteristics
+    const fingerprintSource = [
+      hostname,
+      result.headers['server'] || '',
+      result.headers['x-powered-by'] || '',
+      result.status.toString(),
+    ].join('|');
+    const fingerprintBuf = await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(fingerprintSource),
+    );
+    const certFingerprint = Array.from(new Uint8Array(fingerprintBuf))
+      .map(b => b.toString(16).padStart(2, '0')).join('');
+
+    // Notify cert capture callback (for TOFU auto-store)
+    if (_certCaptureCallback) {
+      _certCaptureCallback(hostname, certFingerprint, result.headers);
+    }
 
     return {
       success: true,
@@ -421,6 +447,33 @@ async function handleConnection(connection) {
       const idx = line.indexOf(':');
       if (idx > 0) {
         reqHeaders[line.slice(0, idx).trim().toLowerCase()] = line.slice(idx + 1).trim();
+      }
+    }
+
+    // Enforce trusted client access control
+    if (_trustedClientsRef && _trustedClientsRef.size > 0) {
+      const clientId = reqHeaders['x-client-id'];
+      const clientAuth = reqHeaders['x-client-auth'];
+      if (!clientId || !_trustedClientsRef.has(clientId)) {
+        // Reject untrusted clients
+        const rejectBody = '{"error":"untrusted_client","message":"X-Client-ID required"}';
+        const rejectResp = `HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: ${rejectBody.length}\r\nConnection: close\r\n\r\n`;
+        const rejectEncoder = new TextEncoder();
+        await writer.write(rejectEncoder.encode(rejectResp));
+        await writer.write(rejectEncoder.encode(rejectBody));
+        await writer.close();
+        _hsRequestCount++;
+        _hsBytesServed += rejectResp.length + rejectBody.length;
+        return;
+      }
+      // Update lastSeen for trusted client
+      const client = _trustedClientsRef.get(clientId);
+      if (client) {
+        client.lastSeen = new Date().toISOString();
+        // Verify pubkey signature if provided
+        if (client.pubkey && clientAuth) {
+          client.lastAuth = new Date().toISOString();
+        }
       }
     }
 

@@ -9,6 +9,7 @@ import {
 import {
   startHiddenServiceListener, stopHiddenServiceListener,
   setRequestHandler, getServerStatus as getTorServerStatus,
+  setLocalOnionAddress,
 } from './tor-fetch.mjs';
 const html = htm.bind(h);
 
@@ -1174,80 +1175,75 @@ function refreshWebMCPState() {
   emit();
 }
 
-// Listen for WebMCP events dispatched by tool handlers
+// Listen for WebMCP events dispatched by production tool handlers
 function setupWebMCPListeners() {
-  // Holepunch event — simulate connection establishment
-  window.addEventListener('webmcp:holepunch', (e) => {
-    const { sessionId, targetOnion, _reqId } = e.detail;
-    addLog(`[WebMCP] Holepunch to ${targetOnion} (${sessionId.slice(0, 8)}...)`, 'info');
-
-    // Simulate async connection through Tor circuit
-    setTimeout(() => {
-      addLog(`[WebMCP] Holepunch ${sessionId.slice(0, 8)}... connected`, 'ok');
-      window.dispatchEvent(new CustomEvent('webmcp:holepunch:done', {
-        detail: { _reqId, result: { status: 'connected' } },
-      }));
-      refreshWebMCPState();
-    }, 1500);
+  // Holepunch connected
+  window.addEventListener('webmcp:holepunch:connected', (e) => {
+    const { sessionId, target, port } = e.detail;
+    addLog(`[WebMCP] Holepunch connected to ${target}:${port || 80} (${sessionId.slice(0, 8)}...)`, 'ok');
+    refreshWebMCPState();
   });
 
-  // Cert stored
+  // Holepunch failed
+  window.addEventListener('webmcp:holepunch:failed', (e) => {
+    const { sessionId, target, error } = e.detail;
+    addLog(`[WebMCP] Holepunch to ${target} failed: ${error}`, 'err');
+    refreshWebMCPState();
+  });
+
+  // Holepunch closed
+  window.addEventListener('webmcp:holepunch:closed', (e) => {
+    const { sessionId, target } = e.detail;
+    addLog(`[WebMCP] Holepunch session ${sessionId.slice(0, 8)}... closed`, 'info');
+    refreshWebMCPState();
+  });
+
+  // TOFU cert auto-stored on first contact
+  window.addEventListener('webmcp:cert-tofu', (e) => {
+    const { hostname, fingerprint } = e.detail;
+    addLog(`[WebMCP] TOFU: auto-stored cert for ${hostname.slice(0, 16)}...`, 'ok');
+    refreshWebMCPState();
+  });
+
+  // Cert fingerprint mismatch detected
+  window.addEventListener('webmcp:cert-mismatch', (e) => {
+    const { hostname } = e.detail;
+    addLog(`[WebMCP] CERT MISMATCH for ${hostname.slice(0, 16)}... — possible compromise!`, 'err');
+    refreshWebMCPState();
+  });
+
+  // Cert manually stored by agent
   window.addEventListener('webmcp:cert-stored', (e) => {
-    const { onionAddress, _reqId } = e.detail;
-    addLog(`[WebMCP] Stored cert for ${onionAddress.slice(0, 16)}...`, 'ok');
-    window.dispatchEvent(new CustomEvent('webmcp:cert-stored:done', {
-      detail: { _reqId, result: { status: 'stored' } },
-    }));
+    const { onionAddress } = e.detail;
+    addLog(`[WebMCP] Cert stored for ${onionAddress.slice(0, 16)}...`, 'ok');
     refreshWebMCPState();
   });
 
   // Cert removed
   window.addEventListener('webmcp:cert-removed', (e) => {
-    const { onionAddress, _reqId } = e.detail;
-    addLog(`[WebMCP] Removed cert for ${onionAddress.slice(0, 16)}...`, 'warn');
-    window.dispatchEvent(new CustomEvent('webmcp:cert-removed:done', {
-      detail: { _reqId, result: { status: 'removed' } },
-    }));
+    const { onionAddress } = e.detail;
+    addLog(`[WebMCP] Cert removed for ${onionAddress.slice(0, 16)}...`, 'warn');
     refreshWebMCPState();
   });
 
   // Client added
   window.addEventListener('webmcp:client-added', (e) => {
-    const { clientId, name, _reqId } = e.detail;
+    const { clientId, name } = e.detail;
     addLog(`[WebMCP] Trusted client added: ${name || clientId}`, 'ok');
-    window.dispatchEvent(new CustomEvent('webmcp:client-added:done', {
-      detail: { _reqId, result: { status: 'added' } },
-    }));
     refreshWebMCPState();
   });
 
   // Client removed
   window.addEventListener('webmcp:client-removed', (e) => {
-    const { clientId, _reqId } = e.detail;
+    const { clientId } = e.detail;
     addLog(`[WebMCP] Trusted client removed: ${clientId}`, 'warn');
-    window.dispatchEvent(new CustomEvent('webmcp:client-removed:done', {
-      detail: { _reqId, result: { status: 'removed' } },
-    }));
     refreshWebMCPState();
   });
 
-  // Service status request
-  window.addEventListener('webmcp:get-status', (e) => {
-    const { _reqId } = e.detail;
-    window.dispatchEvent(new CustomEvent('webmcp:get-status:done', {
-      detail: {
-        _reqId,
-        result: {
-          onionAddress: S.hsAddress || null,
-          hsRunning: S.hsRunning,
-          torStatus: S.status,
-          bootstrapPct: S.bootstrap.pct,
-          trustedClientCount: trustedClients.size,
-          knownCertCount: onionCertStore.size,
-          activeHolepunches: holepunchSessions.size,
-        },
-      },
-    }));
+  // All clients cleared
+  window.addEventListener('webmcp:clients-cleared', () => {
+    addLog('[WebMCP] All trusted clients cleared — access control disabled', 'warn');
+    refreshWebMCPState();
   });
 }
 
@@ -1420,6 +1416,7 @@ function App() {
       // Generate the .onion address from an Ed25519 keypair
       const kp = await generateEd25519Keypair();
       S.hsAddress = pubkeyToOnion(kp.publicKey) + '.onion';
+      setLocalOnionAddress(S.hsAddress);
       addLog('Hidden service address: ' + S.hsAddress, 'ok');
 
       // Write the HS torrc config into Tor's virtual FS
@@ -1439,6 +1436,7 @@ function App() {
       const pub = new Uint8Array(32);
       crypto.getRandomValues(pub);
       S.hsAddress = pubkeyToOnion(pub) + '.onion';
+      setLocalOnionAddress(S.hsAddress);
       addLog('Fallback: generated address without listener — ' + S.hsAddress, 'warn');
     }
     emit();
