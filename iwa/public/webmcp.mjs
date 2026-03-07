@@ -830,7 +830,7 @@ export function registerWebMCPTools() {
   navigator.modelContext.registerTool(
     'fetchOnion',
     {
-      description: 'Fetch a .onion URL through this IWA\'s Tor circuit using Direct Sockets SOCKS5. Returns the HTTP response plus TOFU certificate verification status. Fingerprints are auto-captured on first contact and verified on subsequent fetches. Supports optional OHTTP (Oblivious HTTP) encapsulation.',
+      description: 'Fetch a .onion URL through this IWA\'s Tor circuit using Direct Sockets SOCKS5. Returns the HTTP response plus TOFU certificate verification status. Fingerprints are auto-captured on first contact and verified on subsequent fetches. Optional useOHTTP flag enables RFC 9458 OHTTP framing demo (correct BHTTP encoding + AES-GCM, self-keyed — ready for a real relay).',
       parameters: {
         type: 'object',
         properties: {

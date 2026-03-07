@@ -1,0 +1,85 @@
+## Title
+
+Add Tor Hidden Service IWA — WebMCP tools for anonymous AI agent networking
+
+## Body
+
+### Summary
+
+This PR adds a **Tor Hidden Service running inside an Isolated Web App** with 6 WebMCP tools that give AI agents capabilities they can't get any other way: anonymous `.onion` browsing, peer-to-peer connections over Tor, and cryptographic access control for hidden services.
+
+**Live demo**: An AI agent can `fetchOnion` to browse `.onion` sites through the user's Tor circuit, `holepunch` to open direct TCP connections to other hidden services for anonymous agent-to-agent communication, and `manageTrustedClients` to control who can access the hidden service with Ed25519 signature verification.
+
+### Why this is interesting for WebMCP
+
+This is the first WebMCP integration that gives AI agents access to **network-level capabilities** rather than just application features:
+
+1. **`fetchOnion`** — AI agents cannot normally reach `.onion` addresses. This tool routes requests through a real Tor circuit via Direct Sockets SOCKS5, returning HTTP responses with automatic TOFU certificate verification. The agent gets anonymous web access to the entire `.onion` ecosystem.
+
+2. **`holepunch`** — Opens real bidirectional TCP connections to other `.onion` hidden services. This is the foundation for **anonymous AI-to-AI communication** — Agent A publishes a `.onion`, Agent B holepunches to it, they exchange messages without either knowing the other's IP address. Supports `connect` / `send` / `receive` / `close` actions on persistent sessions.
+
+3. **`validateOnionCert`** — Trust-on-first-use (TOFU) certificate management. Service fingerprints are auto-captured on every `fetchOnion` call and compared on subsequent fetches. Detects identity changes that may indicate service compromise. The AI agent manages its own trust decisions about anonymous services.
+
+4. **`manageTrustedClients`** — Real access control enforcement on the hidden service. When trusted clients are added, the HS HTTP handler rejects requests without a valid `X-Client-ID` header (returns 403). Supports Ed25519 public key registration and signature verification via `X-Client-Auth` headers.
+
+5. **`getServiceStatus`** — Aggregated dashboard of the entire system: HS uptime/request/byte stats, access control state, cert store health, active holepunch sessions, and recent fetch errors.
+
+6. **`listHolepunchSessions`** — Lists all peer connections with connection status, message/byte counts, and timestamps.
+
+### Technical highlights
+
+- **No build step** — Pure ESM with Preact + htm, vendored dependencies
+- **Real Tor** — `tor.js` + `tor.wasm` compiled via Emscripten, connects to the actual Tor network
+- **Real TCP** — `TCPSocket` for SOCKS5 outbound, `TCPServerSocket` for HS inbound (Direct Sockets API)
+- **OPFS keypair persistence** — `.onion` address survives page reloads via Origin Private File System
+- **Web Locks** — Prevents multiple tabs from fighting over the HS listener port
+- **Ed25519 via Web Crypto** — `.onion` v3 address derivation (SHA3-256 checksum) and client auth signatures
+- **OHTTP framing demo** — Correct RFC 9458 Binary HTTP encoding with AES-GCM, ready for a real relay
+- **Visibility-aware animations** — Canvas loops pause when tab is hidden to save battery
+- **O(n) buffer handling** — Chunk-then-concat pattern for SOCKS5/HTTP response reading
+
+### Browser API surface
+
+| API | Usage |
+|-----|-------|
+| Direct Sockets | `TCPSocket` (SOCKS5), `TCPServerSocket` (HS listener) |
+| WebMCP | `navigator.modelContext.registerTool()` x 6 |
+| Web Crypto | Ed25519 keygen/sign/verify, AES-GCM, ECDH, SHA-256 |
+| OPFS | `navigator.storage.getDirectory()` for keypair persistence |
+| Web Locks | `navigator.locks.request()` for HS singleton |
+| File System Access | `showDirectoryPicker()` for Tor data dir |
+| Service Worker | Offline asset caching |
+| Trusted Types | CSP compliance (IWA requirement) |
+
+### What an AI agent can do with these tools
+
+```
+Agent: "I want to check if the DuckDuckGo onion service is up"
+→ fetchOnion({ url: "http://duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion/" })
+→ { success: true, status: 200, certVerification: { known: false, note: "First contact — fingerprint auto-stored via TOFU" } }
+
+Agent: "Connect to another agent's hidden service"
+→ holepunch({ action: "connect", targetOnion: "abc123...xyz.onion", port: 80 })
+→ { success: true, sessionId: "...", status: "connected" }
+
+Agent: "Send a message"
+→ holepunch({ action: "send", sessionId: "...", message: '{"hello": "world"}' })
+→ { success: true, bytesSent: 22 }
+
+Agent: "Lock down my hidden service to only trusted clients"
+→ manageTrustedClients({ action: "add", clientId: "agent-b", pubkey: "base64..." })
+→ { success: true, note: "Access control is now ACTIVE" }
+```
+
+### Test plan
+
+- [ ] Load IWA in Chrome Canary with `#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`, `#direct-sockets`, `#enable-web-mcp` flags
+- [ ] Start Tor, verify bootstrap reaches 100%
+- [ ] Start hidden service, verify `.onion` address is generated (check OPFS persistence by reloading)
+- [ ] Register WebMCP tools, verify 6 tools appear in `navigator.modelContext`
+- [ ] Test `fetchOnion` with a known `.onion` address
+- [ ] Test `holepunch` connect/send/receive/close lifecycle
+- [ ] Test `manageTrustedClients` add/verify/remove and verify HS returns 403 to untrusted requests
+- [ ] Test `validateOnionCert` TOFU auto-capture after `fetchOnion`
+- [ ] Verify canvas animations pause when tab is backgrounded
+- [ ] Verify Web Locks prevent duplicate HS listener across tabs

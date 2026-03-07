@@ -26,9 +26,16 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
 // ────────────────────────────────────────────
 // Particle mesh background
 // ────────────────────────────────────────────
+// ── Visibility-aware animation helper ──
+// Pauses all rAF loops when the tab is hidden to save battery/CPU
+let _tabVisible = !document.hidden;
+document.addEventListener('visibilitychange', () => { _tabVisible = !document.hidden; });
+
 (function initBg() {
   const c = document.getElementById('bg-canvas'), ctx = c.getContext('2d');
-  const pts = [], N = 40, D = 140;
+  const N = Math.min(40, (navigator.hardwareConcurrency || 4) * 8);
+  const D = 140;
+  const pts = [];
   function resize() { c.width = innerWidth; c.height = innerHeight; }
   addEventListener('resize', resize); resize();
   for (let i = 0; i < N; i++) pts.push({
@@ -37,21 +44,23 @@ const ttPolicy = (typeof trustedTypes !== 'undefined' && trustedTypes.createPoli
     r: Math.random() * 1.6 + 0.8,
   });
   (function loop() {
-    ctx.clearRect(0, 0, c.width, c.height);
-    for (let i = 0; i < pts.length; i++) {
-      const p = pts[i];
-      p.x += p.vx; p.y += p.vy;
-      if (p.x < 0 || p.x > c.width) p.vx *= -1;
-      if (p.y < 0 || p.y > c.height) p.vy *= -1;
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.28);
-      ctx.fillStyle = 'rgba(123,77,255,0.4)'; ctx.fill();
-      for (let j = i + 1; j < pts.length; j++) {
-        const q = pts[j];
-        const dx = p.x - q.x, dy = p.y - q.y, d = Math.sqrt(dx * dx + dy * dy);
-        if (d < D) {
-          ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
-          ctx.strokeStyle = `rgba(123,77,255,${0.1 * (1 - d / D)})`;
-          ctx.lineWidth = 0.5; ctx.stroke();
+    if (_tabVisible) {
+      ctx.clearRect(0, 0, c.width, c.height);
+      for (let i = 0; i < pts.length; i++) {
+        const p = pts[i];
+        p.x += p.vx; p.y += p.vy;
+        if (p.x < 0 || p.x > c.width) p.vx *= -1;
+        if (p.y < 0 || p.y > c.height) p.vy *= -1;
+        ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 6.28);
+        ctx.fillStyle = 'rgba(123,77,255,0.4)'; ctx.fill();
+        for (let j = i + 1; j < pts.length; j++) {
+          const q = pts[j];
+          const dx = p.x - q.x, dy = p.y - q.y, d = Math.sqrt(dx * dx + dy * dy);
+          if (d < D) {
+            ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y);
+            ctx.strokeStyle = `rgba(123,77,255,${0.1 * (1 - d / D)})`;
+            ctx.lineWidth = 0.5; ctx.stroke();
+          }
         }
       }
     }
@@ -341,8 +350,10 @@ function Tachometer({ speed }) {
     let raf;
     function draw() {
       if (!ref.current) return;
-      animSpeed.current += (speed - animSpeed.current) * 0.12;
-      drawTacho(ref.current, animSpeed.current);
+      if (_tabVisible) {
+        animSpeed.current += (speed - animSpeed.current) * 0.12;
+        drawTacho(ref.current, animSpeed.current);
+      }
       raf = requestAnimationFrame(draw);
     }
     draw();
@@ -494,7 +505,7 @@ function NetworkDiagram({ circuit, status }) {
   useEffect(() => {
     let raf;
     function draw(t) {
-      if (ref.current) drawNetwork(ref.current, circuit, status, t);
+      if (ref.current && _tabVisible) drawNetwork(ref.current, circuit, status, t);
       raf = requestAnimationFrame(draw);
     }
     draw(0);
@@ -729,7 +740,7 @@ function ComplexityViz({ prefix }) {
   useEffect(() => {
     let raf;
     function draw(t) {
-      if (ref.current) drawComplexityViz(ref.current, prefix, t);
+      if (ref.current && _tabVisible) drawComplexityViz(ref.current, prefix, t);
       raf = requestAnimationFrame(draw);
     }
     draw(0);
@@ -843,16 +854,11 @@ function pubkeyToOnion(pubkey) {
   return base32Encode(addrBytes);
 }
 
-// Ed25519 keypair generation using Web Crypto (for speed) with fallback
-// We generate raw X25519 keys and derive ed25519 format for .onion
-// Actually, we need proper Ed25519 for Tor. Use a fast approach:
-// Generate random 32 bytes as seed, derive keypair deterministically.
-// For vanity generation speed, we use batched generation.
+// Ed25519 keypair generation using Web Crypto with OPFS persistence.
+// Persisting the keypair in OPFS gives a stable .onion address across sessions.
 let _vanityWorker = null;
 
 async function generateEd25519Keypair() {
-  // Use Web Crypto to generate an Ed25519 keypair
-  // Ed25519 is supported in modern browsers
   try {
     const keyPair = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
     const rawPub = await crypto.subtle.exportKey('raw', keyPair.publicKey);
@@ -866,6 +872,47 @@ async function generateEd25519Keypair() {
     const pub = new Uint8Array(32);
     crypto.getRandomValues(pub);
     return { publicKey: pub, privateKey: new Uint8Array(64) };
+  }
+}
+
+// OPFS-based keypair persistence — survives page reloads for stable .onion address
+async function loadOrCreateKeypair() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    const dir = await root.getDirectoryHandle('hs-keys', { create: true });
+
+    // Try to load existing keypair
+    try {
+      const pubHandle = await dir.getFileHandle('pub.key');
+      const privHandle = await dir.getFileHandle('priv.key');
+      const pubFile = await pubHandle.getFile();
+      const privFile = await privHandle.getFile();
+      const publicKey = new Uint8Array(await pubFile.arrayBuffer());
+      const privateKey = new Uint8Array(await privFile.arrayBuffer());
+      if (publicKey.length === 32 && privateKey.length > 0) {
+        addLog('Loaded persisted HS keypair from OPFS', 'ok');
+        return { publicKey, privateKey, persisted: true };
+      }
+    } catch (e) {
+      // No existing keypair — generate new one
+    }
+
+    // Generate and persist
+    const kp = await generateEd25519Keypair();
+    const pubHandle = await dir.getFileHandle('pub.key', { create: true });
+    const privHandle = await dir.getFileHandle('priv.key', { create: true });
+    const pubW = await pubHandle.createWritable();
+    await pubW.write(kp.publicKey);
+    await pubW.close();
+    const privW = await privHandle.createWritable();
+    await privW.write(kp.privateKey);
+    await privW.close();
+    addLog('Generated and persisted new HS keypair to OPFS', 'ok');
+    return { ...kp, persisted: true };
+  } catch (e) {
+    // OPFS not available — fall back to ephemeral keypair
+    addLog('OPFS not available — keypair is ephemeral (' + e.message + ')', 'warn');
+    return { ...(await generateEd25519Keypair()), persisted: false };
   }
 }
 
@@ -1413,11 +1460,11 @@ function App() {
       await startHiddenServiceListener(8080);
       addLog('TCPServerSocket listening on 127.0.0.1:8080', 'ok');
 
-      // Generate the .onion address from an Ed25519 keypair
-      const kp = await generateEd25519Keypair();
+      // Load persisted keypair from OPFS, or generate a new one
+      const kp = await loadOrCreateKeypair();
       S.hsAddress = pubkeyToOnion(kp.publicKey) + '.onion';
       setLocalOnionAddress(S.hsAddress);
-      addLog('Hidden service address: ' + S.hsAddress, 'ok');
+      addLog('Hidden service address: ' + S.hsAddress + (kp.persisted ? ' (persisted)' : ' (ephemeral)'), 'ok');
 
       // Write the HS torrc config into Tor's virtual FS
       const fs = window.Module?.FS || (typeof FS !== 'undefined' ? FS : null);

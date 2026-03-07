@@ -137,9 +137,9 @@ async function httpOverSocks(hostname, port, path, method, headers, body) {
 
     await writer.write(new TextEncoder().encode(httpReq));
 
-    // Read full response
-    let responseData = new Uint8Array(initialBuf);
-    const decoder = new TextDecoder();
+    // Read full response — collect chunks then concat once (avoids O(n^2))
+    const chunks = initialBuf.length > 0 ? [initialBuf] : [];
+    let totalLen = initialBuf.length;
     const maxSize = 2 * 1024 * 1024; // 2MB limit
     let timedOut = false;
 
@@ -149,19 +149,25 @@ async function httpOverSocks(hostname, port, path, method, headers, body) {
       while (!timedOut) {
         const { value, done } = await reader.read();
         if (done) break;
-        const merged = new Uint8Array(responseData.length + value.length);
-        merged.set(responseData);
-        merged.set(value, responseData.length);
-        responseData = merged;
-        if (responseData.length > maxSize) break;
+        chunks.push(value);
+        totalLen += value.length;
+        if (totalLen > maxSize) break;
       }
     } catch (e) {
       // Connection closed by remote — normal for Connection: close
     }
     clearTimeout(timeout);
 
+    // Concat once
+    const responseData = new Uint8Array(totalLen);
+    let off = 0;
+    for (const chunk of chunks) {
+      responseData.set(chunk, off);
+      off += chunk.length;
+    }
+
     // Parse HTTP response
-    const rawText = decoder.decode(responseData);
+    const rawText = new TextDecoder().decode(responseData);
     const headerEnd = rawText.indexOf('\r\n\r\n');
     if (headerEnd === -1) {
       return { status: 0, statusText: 'Malformed response', headers: {}, body: rawText };
@@ -188,11 +194,15 @@ async function httpOverSocks(hostname, port, path, method, headers, body) {
   }
 }
 
-// ── OHTTP-style encapsulation ──
-// Wraps the .onion fetch request in an encrypted Binary HTTP (BHTTP)
-// envelope. In a full deployment, this would use HPKE to encrypt to
-// an oblivious relay's public key. Here we implement the framing so
-// the protocol is correct and ready for a real relay.
+// ── OHTTP encapsulation (FRAMING DEMO) ──
+// Implements RFC 9458 Oblivious HTTP request framing with correct
+// Binary HTTP (RFC 9292) encoding and AES-GCM encryption.
+// NOTE: This is a FRAMING DEMO — the request is self-keyed (encrypted
+// with a locally-generated key, not a relay's HPKE public key).
+// The protocol structure is production-correct and ready to swap in
+// a real OHTTP relay's public key config for end-to-end privacy.
+// What it demonstrates: BHTTP encoding, HPKE envelope structure,
+// AES-GCM authenticated encryption — all the pieces except the relay.
 
 async function ohttpEncapsulate(request) {
   // Generate ephemeral ECDH key pair for HPKE-like key agreement
@@ -377,6 +387,7 @@ export async function fetchOnion({ url, method, headers, body, useOHTTP }) {
 
 let _serverSocket = null;
 let _serverRunning = false;
+let _lockRelease = null;
 const _serverConnections = [];
 let _requestHandler = defaultHandler;
 let _hsStartTime = 0;
@@ -413,28 +424,45 @@ async function handleConnection(connection) {
     const reader = readable.getReader();
     const writer = writable.getWriter();
 
-    // Read HTTP request
-    let requestData = new Uint8Array(0);
+    // Read HTTP request — collect chunks then concat once
+    const reqChunks = [];
+    let reqLen = 0;
     const timeout = setTimeout(() => reader.cancel(), 10000);
 
     try {
       while (true) {
         const { value, done } = await reader.read();
         if (done) break;
-        const merged = new Uint8Array(requestData.length + value.length);
-        merged.set(requestData);
-        merged.set(value, requestData.length);
-        requestData = merged;
+        reqChunks.push(value);
+        reqLen += value.length;
 
-        // Check if we have a complete HTTP request (headers end with \r\n\r\n)
-        const text = new TextDecoder().decode(requestData);
-        if (text.includes('\r\n\r\n')) break;
-        if (requestData.length > 64 * 1024) break; // 64KB header limit
+        // Check if we have complete headers — peek at last chunk boundary
+        const partial = new TextDecoder().decode(value);
+        if (partial.includes('\r\n\r\n')) break;
+        // Also check across chunk boundary
+        if (reqChunks.length > 1) {
+          const tail = new Uint8Array(8);
+          const prev = reqChunks[reqChunks.length - 2];
+          const cur = value;
+          const tailSrc = prev.length >= 4
+            ? new Uint8Array([...prev.slice(-3), ...cur.slice(0, Math.min(4, cur.length))])
+            : cur;
+          if (new TextDecoder().decode(tailSrc).includes('\r\n\r\n')) break;
+        }
+        if (reqLen > 64 * 1024) break; // 64KB header limit
       }
     } catch (e) {
       // Read error — client disconnected
     }
     clearTimeout(timeout);
+
+    // Concat once
+    const requestData = new Uint8Array(reqLen);
+    let reqOff = 0;
+    for (const chunk of reqChunks) {
+      requestData.set(chunk, reqOff);
+      reqOff += chunk.length;
+    }
 
     // Parse request
     const requestText = new TextDecoder().decode(requestData);
@@ -470,9 +498,30 @@ async function handleConnection(connection) {
       const client = _trustedClientsRef.get(clientId);
       if (client) {
         client.lastSeen = new Date().toISOString();
-        // Verify pubkey signature if provided
+        client.requestCount = (client.requestCount || 0) + 1;
+        // Verify Ed25519 signature if client has a pubkey and provided auth
         if (client.pubkey && clientAuth) {
-          client.lastAuth = new Date().toISOString();
+          try {
+            const pubKeyBuf = Uint8Array.from(atob(client.pubkey), c => c.charCodeAt(0));
+            const cryptoKey = await crypto.subtle.importKey(
+              'raw', pubKeyBuf, 'Ed25519', false, ['verify']
+            );
+            // clientAuth = base64(sign(clientId + ":" + timestamp))
+            // timestamp is in X-Client-Timestamp header
+            const clientTs = reqHeaders['x-client-timestamp'] || '';
+            const message = new TextEncoder().encode(clientId + ':' + clientTs);
+            const sig = Uint8Array.from(atob(clientAuth), c => c.charCodeAt(0));
+            const valid = await crypto.subtle.verify('Ed25519', cryptoKey, sig, message);
+            if (valid) {
+              client.lastAuth = new Date().toISOString();
+              client.authVerified = true;
+            } else {
+              client.authVerified = false;
+            }
+          } catch (e) {
+            // Signature verification failed — still allow (trust by ID)
+            client.authVerified = false;
+          }
         }
       }
     }
@@ -516,6 +565,30 @@ export async function startHiddenServiceListener(port = 8080) {
     return { running: true, port };
   }
 
+  // Acquire a Web Lock to prevent multiple tabs from binding the same port
+  if (navigator.locks) {
+    try {
+      // ifAvailable: true means fail immediately if another tab holds the lock
+      const granted = await new Promise((resolve) => {
+        navigator.locks.request('tor-hs-listener', { ifAvailable: true }, (lock) => {
+          if (!lock) { resolve(false); return; }
+          // Hold lock until HS is stopped — return a promise that never resolves
+          // while the server is running
+          resolve(true);
+          return new Promise((releaseLock) => {
+            _lockRelease = releaseLock;
+          });
+        });
+      });
+      if (!granted) {
+        throw new Error('Another tab is already running the hidden service listener');
+      }
+    } catch (e) {
+      if (e.message.includes('Another tab')) throw e;
+      // Web Locks API issue — proceed without lock
+    }
+  }
+
   _serverSocket = new TCPServerSocket('127.0.0.1', { localPort: port });
   const { readable } = await _serverSocket.opened;
   _serverRunning = true;
@@ -548,6 +621,11 @@ export async function stopHiddenServiceListener() {
     _serverSocket = null;
   }
   _serverConnections.length = 0;
+  // Release Web Lock so another tab can take over
+  if (_lockRelease) {
+    _lockRelease();
+    _lockRelease = null;
+  }
   return { running: false };
 }
 
