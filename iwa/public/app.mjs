@@ -1012,7 +1012,7 @@ function formatBytes(b) {
 function HiddenServiceCard({ running, address, stats, onStart, onStop }) {
   const display = address || 'not running';
   return html`
-    <div class="card hs-card">
+    <div class="card hs-card ${running ? 'running' : ''}"
       <div class="card-head">
         Hidden Service
         <span class="hs-status-dot ${running ? 'on' : ''}"></span>
@@ -1265,7 +1265,7 @@ function WebMCPCard({ available, enabled, onEnable, onDisable }) {
   ];
 
   return html`
-    <div class="card webmcp-card">
+    <div class="card webmcp-card ${enabled ? 'active' : ''}"
       <div class="card-head">
         WebMCP
         <span class="webmcp-badge ${enabled ? 'active' : ''}">${enabled ? 'ACTIVE' : available ? 'READY' : 'N/A'}</span>
@@ -1565,7 +1565,23 @@ function App() {
 
     <${ConfigModal} open=${s.configModalOpen} onClose=${closeConfig} />
 
-    <footer>Tor 0.4.9.5 \u00b7 WebAssembly \u00b7 Direct Sockets \u00b7 WebMCP \u00b7 Isolated Web App</footer>
+    <footer>
+      <span>Tor 0.4.9.5</span>
+      <span class="footer-sep">\u2502</span>
+      <div class="footer-dots">
+        <div class="footer-indicator ${s.status === 'connected' ? 'tor on' : 'tor'}">
+          <span class="fdot"></span><span>Tor</span>
+        </div>
+        <div class="footer-indicator ${s.hsRunning ? 'hs on' : 'hs'}">
+          <span class="fdot"></span><span>HS</span>
+        </div>
+        <div class="footer-indicator ${s.webmcpEnabled ? 'mcp on' : 'mcp'}">
+          <span class="fdot"></span><span>MCP</span>
+        </div>
+      </div>
+      <span class="footer-sep">\u2502</span>
+      <span>IWA</span>
+    </footer>
   `;
 }
 
