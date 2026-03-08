@@ -796,13 +796,14 @@ async function fetchOnionWithCertCheck(params) {
 let _coreToolsRegistered = false;
 
 export function registerWebMCPTools() {
-  if (!navigator.modelContext) {
-    console.log('[WebMCP] navigator.modelContext not available');
-    return false;
-  }
-
   if (_coreToolsRegistered) return true;
   _coreToolsRegistered = true;
+
+  if (!navigator.modelContext) {
+    console.log('[WebMCP] navigator.modelContext not available — Path 1 (native) skipped, Paths 2+3 still work');
+    // Return true so the UI can enable Paths 2 and 3
+    return true;
+  }
 
   // Tool 1: holepunch — real SOCKS5 peer connections over Tor
   navigator.modelContext.registerTool(
@@ -1007,16 +1008,18 @@ export function registerWebMCPTools() {
 }
 
 export function unregisterWebMCPTools() {
-  if (!navigator.modelContext || !_coreToolsRegistered) return;
+  if (!_coreToolsRegistered) return;
   _coreToolsRegistered = false;
 
-  navigator.modelContext.unregisterTool('holepunch');
-  navigator.modelContext.unregisterTool('validateOnionCert');
-  navigator.modelContext.unregisterTool('manageTrustedClients');
-  navigator.modelContext.unregisterTool('listHolepunchSessions');
-  navigator.modelContext.unregisterTool('getServiceStatus');
-  navigator.modelContext.unregisterTool('fetchOnion');
-  navigator.modelContext.unregisterTool('manageOHTTPRelay');
+  if (navigator.modelContext) {
+    navigator.modelContext.unregisterTool('holepunch');
+    navigator.modelContext.unregisterTool('validateOnionCert');
+    navigator.modelContext.unregisterTool('manageTrustedClients');
+    navigator.modelContext.unregisterTool('listHolepunchSessions');
+    navigator.modelContext.unregisterTool('getServiceStatus');
+    navigator.modelContext.unregisterTool('fetchOnion');
+    navigator.modelContext.unregisterTool('manageOHTTPRelay');
+  }
 
   console.log('[WebMCP] Unregistered Tor hidden service tools');
 }

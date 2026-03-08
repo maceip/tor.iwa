@@ -1435,12 +1435,12 @@ function WebMCPCard({ available, enabled, onEnable, onDisable, mcpServerActive, 
       <div class="card-body webmcp-card-body">
         <div class="webmcp-status-row">
           <span class="webmcp-label">navigator.modelContext</span>
-          <span class="webmcp-val ${available ? 'ok' : 'dim'}">${available ? 'Detected' : 'Not detected'}</span>
+          <span class="webmcp-val ${typeof navigator !== 'undefined' && navigator.modelContext ? 'ok' : 'dim'}">${typeof navigator !== 'undefined' && navigator.modelContext ? 'Detected' : 'Not detected (Paths 2+3 still work)'}</span>
         </div>
 
         <div class="webmcp-actions">
           ${!enabled && html`
-            <button class="primary" onClick=${onEnable} disabled=${!available}>Register 7 Tools</button>
+            <button class="primary" onClick=${onEnable}>Enable 7 Tools</button>
           `}
           ${enabled && html`
             <button class="danger" onClick=${onDisable}>Unregister</button>
@@ -1460,7 +1460,7 @@ function WebMCPCard({ available, enabled, onEnable, onDisable, mcpServerActive, 
           <div class="webmcp-paths-section">
             <div class="webmcp-status-row">
               <span class="webmcp-label">Path 1: Native WebMCP</span>
-              <span class="webmcp-val ${enabled ? 'ok' : 'dim'}">${enabled ? 'Active' : 'Off'}</span>
+              <span class="webmcp-val ${enabled && navigator.modelContext ? 'ok' : 'dim'}">${navigator.modelContext ? (enabled ? 'Active' : 'Off') : 'No modelContext'}</span>
             </div>
             <div class="webmcp-status-row">
               <span class="webmcp-label">Path 2: MCP-over-HS</span>
@@ -1714,9 +1714,11 @@ function App() {
 
   // Detect WebMCP availability + poll HS stats
   useEffect(() => {
-    S.webmcpAvailable = !!navigator.modelContext;
-    if (S.webmcpAvailable) {
-      addLog('[WebMCP] navigator.modelContext detected', 'ok');
+    S.webmcpAvailable = true; // Always allow — Paths 2+3 work without navigator.modelContext
+    if (navigator.modelContext) {
+      addLog('[WebMCP] navigator.modelContext detected (Path 1 available)', 'ok');
+    } else {
+      addLog('[WebMCP] navigator.modelContext not detected — Path 1 (native) unavailable, Paths 2+3 work', 'info');
     }
     setupWebMCPListeners();
     emit();
