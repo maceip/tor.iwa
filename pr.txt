@@ -109,6 +109,14 @@ Agent: "Lock down my hidden service"
 → { success: true, note: "Access control is now ACTIVE" }
 ```
 
+### Three MCP communication paths
+
+The IWA isolation boundary means extensions can't inject content scripts, use `externally_connectable`, or `chrome.tabs.sendMessage` into IWA windows. We implement **all three paths** so the community can evaluate:
+
+1. **Path 1: Native WebMCP** — `navigator.modelContext.registerTool()` (already works with flag)
+2. **Path 2: MCP JSON-RPC over Hidden Service** — Standard JSON-RPC at `/.well-known/mcp` on the `.onion` address. Any MCP client on Tor can call tools.
+3. **Path 3: BroadcastChannel + postMessage bridge** — Listens for `mcp:*` messages. Limited by same-origin policy but demonstrates the pattern.
+
 ### Test plan
 
 - [ ] Load IWA in Chrome with `#enable-isolated-web-apps`, `#enable-isolated-web-app-dev-mode`, `#direct-sockets`, `#enable-web-mcp` flags
@@ -124,4 +132,8 @@ Agent: "Lock down my hidden service"
 - [ ] Verify OHTTP relay card shows stats, peer count, and mode indicator
 - [ ] Verify canvas animations pause when tab is backgrounded
 - [ ] Verify Web Locks prevent duplicate HS listener across tabs
-- [ ] Verify footer shows OHTTP indicator dot
+- [ ] Verify footer shows OHTTP and RPC indicator dots
+- [ ] Enable MCP Server (Path 2), verify JSON-RPC at `/.well-known/mcp` responds to `tools/list`
+- [ ] Enable Bridge (Path 3), verify BroadcastChannel and postMessage listeners are active
+- [ ] Send `mcp:ping` via postMessage, verify `mcp:pong` response
+- [ ] Call `tools/call` via JSON-RPC over hidden service, verify tool executes

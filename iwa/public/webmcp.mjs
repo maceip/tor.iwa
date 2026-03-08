@@ -19,6 +19,8 @@ import {
   getRelayPeers,
   getRelayStats,
   isRelayVolunteering,
+  setMCPJsonRpcHandler,
+  isMCPServerEnabled,
 } from './tor-fetch.mjs';
 
 // ── Internal state stores ──
@@ -1019,6 +1021,202 @@ export function unregisterWebMCPTools() {
   console.log('[WebMCP] Unregistered Tor hidden service tools');
 }
 
+// ────────────────────────────────────────────
+// Path 2: MCP JSON-RPC Server over Hidden Service
+// Serves standard MCP protocol at /.well-known/mcp on the .onion address.
+// Any MCP client on Tor can discover and call tools via JSON-RPC.
+// ────────────────────────────────────────────
+
+// Tool dispatch table — maps tool names to handler functions
+const _toolHandlers = {
+  holepunch,
+  validateOnionCert,
+  manageTrustedClients,
+  listHolepunchSessions,
+  getServiceStatus,
+  fetchOnion: fetchOnionWithCertCheck,
+  manageOHTTPRelay,
+};
+
+// JSON-RPC handler called by the HS request handler in tor-fetch.mjs
+async function mcpJsonRpcHandler(bodyText) {
+  let req;
+  try {
+    req = JSON.parse(bodyText);
+  } catch (e) {
+    return JSON.stringify({
+      jsonrpc: '2.0',
+      id: null,
+      error: { code: -32700, message: 'Parse error' },
+    });
+  }
+
+  const { method, params, id } = req;
+
+  // tools/list — return all available tools
+  if (method === 'tools/list') {
+    const tools = [
+      { name: 'holepunch', description: 'Peer-to-peer connections to .onion services via SOCKS5 Direct Sockets' },
+      { name: 'validateOnionCert', description: 'TOFU certificate management for .onion services' },
+      { name: 'manageTrustedClients', description: 'Access control for this hidden service' },
+      { name: 'listHolepunchSessions', description: 'List all holepunch sessions' },
+      { name: 'getServiceStatus', description: 'Comprehensive hidden service status' },
+      { name: 'fetchOnion', description: 'Fetch .onion URLs through Tor with OHTTP privacy' },
+      { name: 'manageOHTTPRelay', description: 'OHTTP relay volunteering and peer management' },
+    ];
+    return JSON.stringify({ jsonrpc: '2.0', id, result: { tools } });
+  }
+
+  // tools/call — execute a tool
+  if (method === 'tools/call') {
+    const toolName = params?.name;
+    const toolArgs = params?.arguments || {};
+    const handler = _toolHandlers[toolName];
+    if (!handler) {
+      return JSON.stringify({
+        jsonrpc: '2.0', id,
+        error: { code: -32601, message: 'Unknown tool: ' + toolName },
+      });
+    }
+    try {
+      const result = await handler(toolArgs);
+      return JSON.stringify({ jsonrpc: '2.0', id, result });
+    } catch (e) {
+      return JSON.stringify({
+        jsonrpc: '2.0', id,
+        error: { code: -32000, message: e.message },
+      });
+    }
+  }
+
+  return JSON.stringify({
+    jsonrpc: '2.0', id,
+    error: { code: -32601, message: 'Unknown method: ' + method },
+  });
+}
+
+let _mcpServerActive = false;
+
+export function enableMCPServer() {
+  setMCPJsonRpcHandler(mcpJsonRpcHandler);
+  _mcpServerActive = true;
+  window.dispatchEvent(new CustomEvent('webmcp:mcp-server-started', { detail: {} }));
+  console.log('[MCP Server] JSON-RPC endpoint active at /.well-known/mcp');
+  return true;
+}
+
+export function disableMCPServer() {
+  setMCPJsonRpcHandler(null);
+  _mcpServerActive = false;
+  window.dispatchEvent(new CustomEvent('webmcp:mcp-server-stopped', { detail: {} }));
+  console.log('[MCP Server] JSON-RPC endpoint disabled');
+  return true;
+}
+
+export function isMCPServerActive() { return _mcpServerActive; }
+
+// ────────────────────────────────────────────
+// Path 3: BroadcastChannel / postMessage Bridge
+// Attempts cross-origin communication between the IWA and
+// extensions or other pages. BroadcastChannel is same-origin only
+// so this uses a window.postMessage listener as fallback for
+// any window that can get a reference to the IWA window.
+// ────────────────────────────────────────────
+
+let _bridgeChannel = null;
+let _bridgeActive = false;
+let _bridgeStats = { messagesReceived: 0, toolCallsHandled: 0, lastMessageAt: null };
+
+function handleBridgeMessage(data, reply) {
+  _bridgeStats.messagesReceived++;
+  _bridgeStats.lastMessageAt = new Date().toISOString();
+
+  // Tool discovery
+  if (data.type === 'mcp:tools/list') {
+    const tools = Object.keys(_toolHandlers);
+    reply({ type: 'mcp:tools/list:result', tools, source: 'tor-iwa' });
+    return;
+  }
+
+  // Tool call
+  if (data.type === 'mcp:tools/call') {
+    const handler = _toolHandlers[data.name];
+    if (!handler) {
+      reply({ type: 'mcp:tools/call:error', name: data.name, error: 'Unknown tool' });
+      return;
+    }
+    _bridgeStats.toolCallsHandled++;
+    handler(data.arguments || {}).then(result => {
+      reply({ type: 'mcp:tools/call:result', name: data.name, id: data.id, result });
+    }).catch(e => {
+      reply({ type: 'mcp:tools/call:error', name: data.name, id: data.id, error: e.message });
+    });
+    return;
+  }
+
+  // Ping/discovery
+  if (data.type === 'mcp:ping') {
+    reply({
+      type: 'mcp:pong',
+      source: 'tor-iwa',
+      tools: Object.keys(_toolHandlers).length,
+      onion: getLocalOnionAddress() || null,
+    });
+    return;
+  }
+}
+
+export function enableBridge() {
+  if (_bridgeActive) return true;
+
+  // BroadcastChannel — same-origin only, works if another IWA page needs to communicate
+  try {
+    _bridgeChannel = new BroadcastChannel('tor-iwa-mcp');
+    _bridgeChannel.onmessage = (e) => {
+      handleBridgeMessage(e.data, (resp) => _bridgeChannel.postMessage(resp));
+    };
+  } catch (e) {
+    // BroadcastChannel not available
+  }
+
+  // window.postMessage — cross-origin capable if caller has a window reference
+  // Extensions with access to chrome.scripting.executeScript could potentially
+  // use window.postMessage, or a popup/tab could use window.open + postMessage
+  window.addEventListener('message', _postMessageListener);
+
+  _bridgeActive = true;
+  _bridgeStats = { messagesReceived: 0, toolCallsHandled: 0, lastMessageAt: null };
+  window.dispatchEvent(new CustomEvent('webmcp:bridge-started', { detail: {} }));
+  console.log('[MCP Bridge] BroadcastChannel + postMessage bridge active');
+  return true;
+}
+
+function _postMessageListener(e) {
+  // Accept messages with the mcp: prefix from any origin
+  if (!e.data || typeof e.data.type !== 'string' || !e.data.type.startsWith('mcp:')) return;
+  handleBridgeMessage(e.data, (resp) => {
+    if (e.source) {
+      e.source.postMessage(resp, e.origin === 'null' ? '*' : e.origin);
+    }
+  });
+}
+
+export function disableBridge() {
+  if (_bridgeChannel) {
+    _bridgeChannel.close();
+    _bridgeChannel = null;
+  }
+  window.removeEventListener('message', _postMessageListener);
+  _bridgeActive = false;
+  window.dispatchEvent(new CustomEvent('webmcp:bridge-stopped', { detail: {} }));
+  console.log('[MCP Bridge] Bridge disabled');
+  return true;
+}
+
+export function isBridgeActive() { return _bridgeActive; }
+export function getBridgeStats() { return { ..._bridgeStats, active: _bridgeActive }; }
+
 // ── Expose stores for UI consumption ──
 export { onionCertStore, trustedClients, holepunchSessions, fetchLog, getServerStatus };
 export { getRelayPeers, getRelayStats, isRelayVolunteering } from './tor-fetch.mjs';
+export { isMCPServerEnabled } from './tor-fetch.mjs';

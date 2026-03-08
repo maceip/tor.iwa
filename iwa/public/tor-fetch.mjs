@@ -22,11 +22,15 @@ export { fetchLog };
 let _trustedClientsRef = null;   // Map reference for HS auth enforcement
 let _certCaptureCallback = null; // called after successful fetchOnion
 let _localOnionAddress = null;   // this node's .onion address
+let _mcpJsonRpcHandler = null;   // MCP JSON-RPC handler (set by webmcp.mjs)
+let _mcpServerEnabled = false;   // Whether MCP-over-HS is active
 
 export function setTrustedClientsRef(mapRef) { _trustedClientsRef = mapRef; }
 export function setCertCaptureCallback(fn) { _certCaptureCallback = fn; }
 export function setLocalOnionAddress(addr) { _localOnionAddress = addr; }
 export function getLocalOnionAddress() { return _localOnionAddress; }
+export function setMCPJsonRpcHandler(fn) { _mcpJsonRpcHandler = fn; _mcpServerEnabled = !!fn; }
+export function isMCPServerEnabled() { return _mcpServerEnabled; }
 
 function logFetch(entry) {
   fetchLog.push({ ...entry, ts: new Date().toISOString() });
@@ -982,6 +986,69 @@ async function handleConnection(connection) {
         return;
       } catch (e) {
         // Relay handling error — fall through to default handler
+      }
+    }
+
+    // Handle MCP JSON-RPC requests (Path 2: MCP-over-hidden-service)
+    if (path === '/.well-known/mcp' && _mcpJsonRpcHandler) {
+      try {
+        const bodyStart = requestText.indexOf('\r\n\r\n');
+        const reqBody = requestText.slice(bodyStart + 4).trim();
+
+        if (method === 'GET') {
+          // Discovery endpoint — return server info
+          const serverInfo = JSON.stringify({
+            jsonrpc: '2.0',
+            result: {
+              name: 'tor-iwa-mcp',
+              version: '1.0.0',
+              description: 'MCP server running inside a Tor Hidden Service IWA',
+              onionAddress: _localOnionAddress || null,
+              capabilities: { tools: true },
+            },
+          });
+          const enc = new TextEncoder();
+          const bodyBuf = enc.encode(serverInfo);
+          const httpResp = enc.encode(
+            `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bodyBuf.length}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n`
+          );
+          await writer.write(httpResp);
+          await writer.write(bodyBuf);
+          await writer.close();
+          _hsRequestCount++;
+          _hsBytesServed += httpResp.length + bodyBuf.length;
+          return;
+        }
+
+        if (method === 'POST') {
+          // JSON-RPC dispatch
+          const rpcResult = await _mcpJsonRpcHandler(reqBody);
+          const enc = new TextEncoder();
+          const bodyBuf = enc.encode(rpcResult);
+          const httpResp = enc.encode(
+            `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${bodyBuf.length}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n`
+          );
+          await writer.write(httpResp);
+          await writer.write(bodyBuf);
+          await writer.close();
+          _hsRequestCount++;
+          _hsBytesServed += httpResp.length + bodyBuf.length;
+          return;
+        }
+
+        // OPTIONS for CORS
+        if (method === 'OPTIONS') {
+          const enc = new TextEncoder();
+          const httpResp = enc.encode(
+            `HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nConnection: close\r\n\r\n`
+          );
+          await writer.write(httpResp);
+          await writer.close();
+          _hsRequestCount++;
+          return;
+        }
+      } catch (e) {
+        // MCP handler error — fall through to default
       }
     }
 
